@@ -55,6 +55,22 @@ import './embyAdapter.js';
     }
 
     /**
+     * Normalize a server URL input - supports formats like:
+     *   192.168.1.100:8096
+     *   http://myserver:8096
+     *   https://emby.example.com
+     *   myserver.local:8096
+     */
+    function normalizeServerUrl(input) {
+        let url = input.trim().replace(/\/+$/, '');
+        // Add protocol if missing
+        if (!/^https?:\/\//i.test(url)) {
+            url = 'http://' + url;
+        }
+        return url;
+    }
+
+    /**
      * Show the Emby server setup page
      */
     function showSetupPage() {
@@ -74,9 +90,10 @@ import './embyAdapter.js';
                 <div id="setup-form">
                     <div style="margin-bottom:20px;">
                         <label style="display:block;margin-bottom:6px;font-size:13px;color:#aaa;">Server Address</label>
-                        <input id="emby-server-url" type="url" placeholder="http://your-server:8096" 
+                        <input id="emby-server-url" type="text" placeholder="192.168.1.100:8096 or https://emby.example.com" 
                                style="width:100%;padding:10px 12px;background:#252525;border:1px solid #333;border-radius:6px;color:#fff;font-size:14px;box-sizing:border-box;outline:none;"
                                onfocus="this.style.borderColor='#00a4dc'" onblur="this.style.borderColor='#333'" />
+                        <p style="margin:4px 0 0;font-size:11px;color:#666;">Supports IP:port, hostname:port, or full URL</p>
                     </div>
                     <div style="margin-bottom:20px;">
                         <label style="display:block;margin-bottom:6px;font-size:13px;color:#aaa;">Username</label>
@@ -111,6 +128,14 @@ import './embyAdapter.js';
             document.getElementById('emby-password').addEventListener('keypress', (e) => {
                 if (e.key === 'Enter') handleConnect();
             });
+            // Also allow Enter on username field
+            document.getElementById('emby-username').addEventListener('keypress', (e) => {
+                if (e.key === 'Enter') document.getElementById('emby-password').focus();
+            });
+            // Also allow Enter on server URL field
+            document.getElementById('emby-server-url').addEventListener('keypress', (e) => {
+                if (e.key === 'Enter') document.getElementById('emby-username').focus();
+            });
         };
 
         if (document.readyState === 'loading') {
@@ -124,13 +149,13 @@ import './embyAdapter.js';
      * Handle the connect button click
      */
     async function handleConnect() {
-        const serverUrl = document.getElementById('emby-server-url').value.trim().replace(/\/+$/, '');
+        const rawServerUrl = document.getElementById('emby-server-url').value.trim();
         const username = document.getElementById('emby-username').value.trim();
         const password = document.getElementById('emby-password').value;
         const statusEl = document.getElementById('emby-status');
         const btn = document.getElementById('emby-connect-btn');
 
-        if (!serverUrl) {
+        if (!rawServerUrl) {
             statusEl.innerHTML = '<span style="color:#e74c3c;">Please enter a server address</span>';
             return;
         }
@@ -139,10 +164,13 @@ import './embyAdapter.js';
             return;
         }
 
+        // Normalize the server URL (handles IP:port, hostname:port, etc.)
+        const serverUrl = normalizeServerUrl(rawServerUrl);
+
         btn.disabled = true;
         btn.textContent = 'Connecting...';
         btn.style.opacity = '0.7';
-        statusEl.innerHTML = '<span style="color:#aaa;">Testing connection...</span>';
+        statusEl.innerHTML = '<span style="color:#aaa;">Testing connection to ' + serverUrl + '...</span>';
 
         // Step 1: Test connection
         const testResult = await window.EmbyAdapter.testConnection(serverUrl);
@@ -154,7 +182,7 @@ import './embyAdapter.js';
             return;
         }
 
-        statusEl.innerHTML = '<span style="color:#aaa;">Connected to ' + (testResult.serverName || 'server') + '. Authenticating...</span>';
+        statusEl.innerHTML = '<span style="color:#aaa;">Connected to ' + (testResult.serverName || 'server') + ' (v' + (testResult.version || '?') + '). Authenticating...</span>';
 
         // Store server info
         localStorage.setItem('emby_server_name', testResult.serverName || '');

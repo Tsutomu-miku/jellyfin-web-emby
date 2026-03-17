@@ -6,8 +6,9 @@
  * 
  * Key differences handled:
  * 1. URL prefix: Emby requires /emby/ prefix on API paths
- * 2. Auth header: Emby uses "Emby" scheme + X-Emby-Authorization
- * 3. Token passing: Emby supports X-Emby-Token header
+ * 2. Auth header: Uses "Emby" scheme in standard Authorization header
+ *    (avoids X-Emby-Authorization to prevent CORS preflight issues)
+ * 3. Token passing: Embedded in Authorization header value
  */
 
 (function() {
@@ -68,7 +69,7 @@
             const parsed = new URL(url, window.location.origin);
             const serverParsed = new URL(embyServerUrl);
 
-            // Must be same origin as Emby server
+            // Must be same origin as Emby server (includes port check)
             if (parsed.origin !== serverParsed.origin) return false;
 
             // Static resources don't need adaptation
@@ -102,7 +103,7 @@
     function addEmbyPrefix(url) {
         try {
             const parsed = new URL(url);
-            if (!parsed.pathname.startsWith('/emby/') && !parsed.pathname.startsWith('/emby/')) {
+            if (!parsed.pathname.startsWith('/emby/')) {
                 parsed.pathname = '/emby' + parsed.pathname;
             }
             return parsed.toString();
@@ -116,10 +117,42 @@
     }
 
     /**
+     * Build the Emby auth header value.
+     * 
+     * IMPORTANT: We use the standard "Authorization" header ONLY (not X-Emby-Authorization)
+     * because many Emby servers behind reverse proxies / Cloudflare only whitelist
+     * "Content-Type" and "Authorization" in their CORS Access-Control-Allow-Headers.
+     * Using custom headers like X-Emby-Authorization triggers a CORS preflight
+     * that gets rejected.
+     * 
+     * Emby accepts both "Emby ..." and "MediaBrowser ..." as the Authorization scheme.
+     */
+    function buildEmbyAuthHeaderValue(token) {
+        const deviceId = localStorage.getItem('emby_device_id') ||
+                        ('emby-web-' + Math.random().toString(36).substr(2, 9));
+        localStorage.setItem('emby_device_id', deviceId);
+
+        const browser = navigator.userAgent.includes('Chrome') ? 'Chrome' :
+                       navigator.userAgent.includes('Firefox') ? 'Firefox' :
+                       navigator.userAgent.includes('Safari') ? 'Safari' : 'Browser';
+
+        let value = 'Emby Client="Jellyfin Web (Emby)", Device="' + browser +
+                   '", DeviceId="' + deviceId + '", Version="' + ADAPTER_VERSION + '"';
+
+        if (token) {
+            value += ', Token="' + token + '"';
+        }
+
+        return value;
+    }
+
+    /**
      * Transform Jellyfin auth header to Emby format
      * 
-     * Jellyfin: Authorization: MediaBrowser Client="...", Device="...", DeviceId="...", Version="...", Token="..."
-     * Emby:     X-Emby-Authorization: Emby Client="...", Device="...", DeviceId="...", Version="...", Token="..."
+     * Jellyfin sends: Authorization: MediaBrowser Client="...", Device="...", DeviceId="...", Version="...", Token="..."
+     * We transform to: Authorization: Emby Client="...", Device="...", DeviceId="...", Version="...", Token="..."
+     * 
+     * Key: We ONLY use the standard Authorization header to avoid CORS issues.
      */
     function transformAuthHeader(value) {
         if (!value) return value;
@@ -139,11 +172,16 @@
     }
 
     /**
-     * Transform request headers for Emby compatibility
+     * Transform request headers for Emby compatibility.
+     * 
+     * CORS strategy: ONLY use standard headers (Authorization, Content-Type)
+     * to avoid triggering preflight rejections on servers that don't whitelist
+     * custom Emby headers.
      */
     function transformHeaders(headers) {
         const newHeaders = new Headers();
         let authValue = null;
+        let hasAuth = false;
 
         // Handle various header input types
         const entries = [];
@@ -157,25 +195,34 @@
 
         for (const [key, value] of entries) {
             const lowerKey = key.toLowerCase();
+
+            // Skip any X-Emby-* custom headers - we don't send them to avoid CORS issues
+            if (lowerKey.startsWith('x-emby-') || lowerKey.startsWith('x-mediabrowser-')) {
+                // Extract token from X-Emby-Token if present
+                if (lowerKey === 'x-emby-token' || lowerKey === 'x-mediabrowser-token') {
+                    if (!embyAccessToken) {
+                        embyAccessToken = value;
+                        localStorage.setItem(EMBY_TOKEN_KEY, value);
+                    }
+                }
+                continue; // Don't copy this header
+            }
+
             if (lowerKey === 'authorization') {
-                // Capture and transform the auth header
+                // Transform the auth header value
                 authValue = transformAuthHeader(value);
-            } else if (lowerKey === 'x-emby-authorization') {
-                // Already in Emby format, keep it
-                authValue = value;
+                hasAuth = true;
             } else {
                 newHeaders.set(key, value);
             }
         }
 
-        // Set the Emby auth header
+        // Set the Authorization header (standard header, CORS-safe)
         if (authValue) {
-            newHeaders.set('X-Emby-Authorization', authValue);
-            // Also keep Authorization for compatibility
             newHeaders.set('Authorization', authValue);
         } else if (embyAccessToken) {
-            // No auth header found but we have a token - add X-Emby-Token
-            newHeaders.set('X-Emby-Token', embyAccessToken);
+            // No auth header found but we have a token - build one
+            newHeaders.set('Authorization', buildEmbyAuthHeaderValue(embyAccessToken));
         }
 
         return newHeaders;
@@ -288,7 +335,7 @@
         // Transform URL: add /emby/ prefix
         const newUrl = addEmbyPrefix(url);
 
-        // Transform headers
+        // Transform headers (CORS-safe: only standard Authorization header)
         const newHeaders = transformHeaders(options.headers);
 
         // Transform body (e.g., auth requests)
@@ -319,6 +366,7 @@
         this._embyOriginalUrl = url;
         this._embyMethod = method;
         this._embyHeaders = {};
+        this._embyAdapted = false;
 
         let adaptedUrl = url;
         if (adapterEnabled && isEmbyApiRequest(String(url))) {
@@ -333,11 +381,23 @@
     XMLHttpRequest.prototype.setRequestHeader = function(name, value) {
         if (this._embyAdapted) {
             const lowerName = name.toLowerCase();
+
+            // Skip custom Emby headers to avoid CORS issues
+            if (lowerName.startsWith('x-emby-') || lowerName.startsWith('x-mediabrowser-')) {
+                // Extract token if present
+                if ((lowerName === 'x-emby-token' || lowerName === 'x-mediabrowser-token') && value) {
+                    if (!embyAccessToken) {
+                        embyAccessToken = value;
+                        localStorage.setItem(EMBY_TOKEN_KEY, value);
+                    }
+                }
+                return; // Don't send this header
+            }
+
             if (lowerName === 'authorization') {
                 const transformed = transformAuthHeader(value);
-                XHRSetHeader.call(this, 'X-Emby-Authorization', transformed);
-                XHRSetHeader.call(this, 'Authorization', transformed);
-                return;
+                this._embyHeaders['Authorization'] = transformed;
+                return XHRSetHeader.call(this, 'Authorization', transformed);
             }
         }
         this._embyHeaders[name] = value;
@@ -348,9 +408,10 @@
         if (this._embyAdapted) {
             const transformedBody = transformBody(this._embyOriginalUrl, body);
 
-            // Add token header if not already present
-            if (embyAccessToken && !this._embyHeaders['X-Emby-Token'] && !this._embyHeaders['Authorization']) {
-                XHRSetHeader.call(this, 'X-Emby-Token', embyAccessToken);
+            // If no Authorization header was set but we have a token, add it
+            if (embyAccessToken && !this._embyHeaders['Authorization']) {
+                const authValue = buildEmbyAuthHeaderValue(embyAccessToken);
+                XHRSetHeader.call(this, 'Authorization', authValue);
             }
 
             // Listen for auth responses
@@ -444,12 +505,13 @@
                 const wsUrl = new URL(url);
                 const serverUrl = new URL(embyServerUrl);
 
-                if (wsUrl.hostname === serverUrl.hostname && wsUrl.port === serverUrl.port) {
+                if (wsUrl.hostname === serverUrl.hostname &&
+                    (wsUrl.port || '80') === (serverUrl.port || '80')) {
                     // Add /emby prefix to WebSocket path if needed
                     if (!wsUrl.pathname.startsWith('/emby')) {
                         wsUrl.pathname = '/emby' + wsUrl.pathname;
                     }
-                    // Add api_key parameter
+                    // Add api_key parameter (query param is CORS-safe for WebSocket)
                     if (embyAccessToken && !wsUrl.searchParams.has('api_key')) {
                         wsUrl.searchParams.set('api_key', embyAccessToken);
                     }
@@ -474,10 +536,15 @@
         version: ADAPTER_VERSION,
 
         /**
-         * Set the Emby server URL
+         * Set the Emby server URL (supports host:port format)
          */
         setServerUrl: function(url) {
-            embyServerUrl = url.replace(/\/+$/, '');
+            // Normalize: ensure protocol prefix
+            let normalized = url.trim().replace(/\/+$/, '');
+            if (!/^https?:\/\//i.test(normalized)) {
+                normalized = 'http://' + normalized;
+            }
+            embyServerUrl = normalized;
             localStorage.setItem(EMBY_SERVER_KEY, embyServerUrl);
             log('Server URL set:', embyServerUrl);
         },
@@ -541,7 +608,14 @@
          * Test connection to Emby server
          */
         testConnection: async function(serverUrl) {
-            const url = (serverUrl || embyServerUrl).replace(/\/+$/, '') + '/emby/System/Info/Public';
+            // Normalize URL
+            let baseUrl = serverUrl || embyServerUrl;
+            baseUrl = baseUrl.trim().replace(/\/+$/, '');
+            if (!/^https?:\/\//i.test(baseUrl)) {
+                baseUrl = 'http://' + baseUrl;
+            }
+
+            const url = baseUrl + '/emby/System/Info/Public';
             try {
                 // Use original fetch to avoid double-adaptation
                 const resp = await originalFetch(url, {
@@ -554,8 +628,7 @@
                     success: true,
                     serverName: data.ServerName,
                     version: data.Version,
-                    id: data.Id,
-                    isEmby: !data.StartupWizardCompleted === undefined // Emby-specific check
+                    id: data.Id
                 };
             } catch (e) {
                 return { success: false, error: e.message };
@@ -563,26 +636,27 @@
         },
 
         /**
-         * Authenticate with Emby server
+         * Authenticate with Emby server.
+         * Uses standard Authorization header only (CORS-safe).
          */
         authenticate: async function(serverUrl, username, password) {
-            const baseUrl = (serverUrl || embyServerUrl).replace(/\/+$/, '');
+            // Normalize URL
+            let baseUrl = (serverUrl || embyServerUrl).trim().replace(/\/+$/, '');
+            if (!/^https?:\/\//i.test(baseUrl)) {
+                baseUrl = 'http://' + baseUrl;
+            }
+
             const url = baseUrl + '/emby/Users/AuthenticateByName';
 
-            const deviceId = localStorage.getItem('emby_device_id') || 
-                            ('emby-web-' + Math.random().toString(36).substr(2, 9));
-            localStorage.setItem('emby_device_id', deviceId);
-
-            const authHeader = 'Emby Client="Jellyfin Web (Emby)", Device="' + 
-                             (navigator.userAgent.includes('Chrome') ? 'Chrome' : 'Browser') + 
-                             '", DeviceId="' + deviceId + '", Version="' + ADAPTER_VERSION + '"';
+            // Build auth header WITHOUT token (login request)
+            const authValue = buildEmbyAuthHeaderValue(null);
 
             try {
                 const resp = await originalFetch(url, {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
-                        'X-Emby-Authorization': authHeader
+                        'Authorization': authValue
                     },
                     body: JSON.stringify({
                         Username: username,
