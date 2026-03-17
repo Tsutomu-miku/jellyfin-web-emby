@@ -1,0 +1,9 @@
+{
+    "menuLinks": [],
+    "servers": [],
+    "plugins": [],
+    "embyAdapter": {
+        "enabled": true,
+        "notes": "This config is for jellyfin-web-emby. Server URL is configured at first launch via the setup UI and stored in localStorage."
+    }
+}
