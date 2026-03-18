@@ -1113,3 +1113,7 @@
     if (embyAccessToken) log('Token: present');
 
 })();
+
+// Ensure Babel (sourceType: 'unambiguous') treats this file as an ES module
+// so that injected core-js polyfills use 'import' syntax consistent with webpack's ESM handling.
+export {};
