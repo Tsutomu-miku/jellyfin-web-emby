@@ -12,6 +12,8 @@
  * 8. PlaybackInfo route fix: no longer translates to /Users/{id}/Items/{id}/PlaybackInfo (v1.6.0)
  * 9. Broadened item ID matching: supports numeric and alphanumeric IDs (v1.6.0)
  * 10. PlaybackInfo UserId injection: ensures UserId in POST body and GET query params (v1.6.0)
+ * 11. Emby client UA spoofing: disguises as official Emby Web client to avoid 401 errors (v1.6.1)
+ * 12. Correct auth header format: uses MediaBrowser prefix and official client parameters (v1.6.1)
  */
 
 (function() {
@@ -19,13 +21,16 @@
 
     // ==================== Configuration ====================
 
-    const ADAPTER_VERSION = '1.6.0';
+    const ADAPTER_VERSION = '1.6.1';
     const STORAGE_KEY = 'emby_adapter_config';
     const EMBY_TOKEN_KEY = 'emby_access_token';
     const EMBY_USER_KEY = 'emby_user_id';
     const EMBY_SERVER_KEY = 'emby_server_url';
     const EMBY_PREFIX_KEY = 'emby_needs_prefix';
     const SPOOFED_VERSION = '10.10.7';
+    
+    // Official Emby Web Client User-Agent (for UA spoofing to avoid 401)
+    const EMBY_OFFICIAL_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0 EmbyWeb/4.8.8.0";
 
     // Paths that should NOT get the /emby/ prefix (static resources)
     const STATIC_EXTENSIONS = [
@@ -486,12 +491,8 @@
                         ('emby-web-' + Math.random().toString(36).substr(2, 9));
         localStorage.setItem('emby_device_id', deviceId);
 
-        const browser = navigator.userAgent.includes('Chrome') ? 'Chrome' :
-                       navigator.userAgent.includes('Firefox') ? 'Firefox' :
-                       navigator.userAgent.includes('Safari') ? 'Safari' : 'Browser';
-
-        let value = 'Emby Client="Jellyfin Web (Emby)", Device="' + browser +
-                   '", DeviceId="' + deviceId + '", Version="' + ADAPTER_VERSION + '"';
+        // Correct MediaBrowser format expected by Emby servers
+        let value = 'MediaBrowser Client="Emby Web", Device="Chrome", DeviceId="' + deviceId + '", Version="4.8.8.0"';
 
         if (token) {
             value += ', Token="' + token + '"';
@@ -502,13 +503,14 @@
     function transformAuthHeader(value) {
         if (!value) return value;
         let transformed = value;
-        if (transformed.startsWith('MediaBrowser ')) {
-            transformed = 'Emby ' + transformed.substring('MediaBrowser '.length);
-        } else if (transformed.startsWith('Jellyfin ')) {
-            transformed = 'Emby ' + transformed.substring('Jellyfin '.length);
-        }
-        if (embyAccessToken && !transformed.includes('Token=')) {
-            transformed += ', Token="' + embyAccessToken + '"';
+        if (transformed.startsWith('MediaBrowser ') || transformed.startsWith('Emby ') || transformed.startsWith('Jellyfin ')) {
+            // Keep existing MediaBrowser prefix but ensure we use the correct format
+            const tokenMatch = value.match(/Token\s*=\s*["']?([^"']+)["']?/i);
+            if (tokenMatch) {
+                transformed = buildEmbyAuthHeaderValue(tokenMatch[1]);
+            } else {
+                transformed = buildEmbyAuthHeaderValue(embyAccessToken);
+            }
         }
         return transformed;
     }
@@ -542,15 +544,24 @@
             }
             if (lowerKey === 'authorization') {
                 authValue = transformAuthHeader(value);
-            } else {
+            } else if (lowerKey !== 'user-agent') { // Skip original User-Agent, we'll set our own
                 newHeaders.set(key, value);
             }
         }
+
+        // Set official Emby Web User-Agent to avoid 401
+        newHeaders.set('User-Agent', EMBY_OFFICIAL_UA);
+        
+        // Also add Accept header to match official client
+        newHeaders.set('Accept', 'application/json, text/plain, */*');
+        newHeaders.set('Accept-Language', 'zh-CN,zh;q=0.9,en;q=0.8');
 
         if (authValue) {
             newHeaders.set('Authorization', authValue);
         } else if (embyAccessToken) {
             newHeaders.set('Authorization', buildEmbyAuthHeaderValue(embyAccessToken));
+            // Also add X-Emby-Authorization header for compatibility
+            newHeaders.set('X-Emby-Authorization', buildEmbyAuthHeaderValue(embyAccessToken));
         }
         return newHeaders;
     }
@@ -679,7 +690,7 @@
             newUrl = ensurePlaybackInfoUserId(newUrl);
         }
 
-        // Transform headers
+        // Transform headers (includes UA spoofing and auth header correction)
         const newHeaders = transformHeaders(options.headers);
 
         const newOptions = {
@@ -796,6 +807,11 @@
                 this._embyHeaders['Authorization'] = transformed;
                 return XHRSetHeader.call(this, 'Authorization', transformed);
             }
+            if (lowerName === 'user-agent') {
+                // Override with official Emby UA
+                this._embyHeaders['User-Agent'] = EMBY_OFFICIAL_UA;
+                return XHRSetHeader.call(this, 'User-Agent', EMBY_OFFICIAL_UA);
+            }
         }
         this._embyHeaders[name] = value;
         return XHRSetHeader.call(this, name, value);
@@ -857,9 +873,17 @@
                 body = transformPlaybackInfoBody(body);
             }
 
+            // Set official Emby User-Agent if not already set
+            if (!this._embyHeaders['User-Agent']) {
+                XHRSetHeader.call(this, 'User-Agent', EMBY_OFFICIAL_UA);
+                this._embyHeaders['User-Agent'] = EMBY_OFFICIAL_UA;
+            }
+
             if (embyAccessToken && !this._embyHeaders['Authorization']) {
                 const authValue = buildEmbyAuthHeaderValue(embyAccessToken);
                 XHRSetHeader.call(this, 'Authorization', authValue);
+                // Also add X-Emby-Authorization header for compatibility
+                XHRSetHeader.call(this, 'X-Emby-Authorization', authValue);
             }
 
             if (needsVersionSpoof(this._embyOriginalUrl)) {
