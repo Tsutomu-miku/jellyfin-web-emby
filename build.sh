@@ -52,29 +52,32 @@ npm ci --no-audit 2>&1 | tail -5
 # ========================================
 echo "[5/7] Patching version checks in node_modules..."
 
-# Patch jellyfin-apiclient: _minServerVersion / minServerVersion
-echo "  - Patching jellyfin-apiclient..."
+# --- jellyfin-apiclient ---
+# IMPORTANT: minServerVersion is a FUNCTION (getter/setter method) on the prototype:
+#   ConnectionManager.prototype.minServerVersion = function(val) { ... return this._minServerVersion; }
+# We must NOT touch that function definition!
+# Instead we only patch the INITIAL VALUE set in the constructor:
+#   self._minServerVersion = '10.1.0';
+echo "  - Patching jellyfin-apiclient initial version value..."
 find "${JELLYFIN_SRC}/node_modules" -name "*.js" -path "*jellyfin-apiclient*" \
-  -exec grep -l "minServerVersion\|_minServerVersion" {} \; 2>/dev/null | while read f; do
+  -exec grep -l "_minServerVersion" {} \; 2>/dev/null | while read f; do
     echo "    Patching: $f"
-    sed -i "s/minServerVersion\s*=\s*['\"][0-9.]*['\"]/minServerVersion='0.0.0'/g" "$f"
-    sed -i "s/_minServerVersion\s*=\s*['\"][0-9.]*['\"]/minServerVersion='0.0.0'/g" "$f"
+    # Only replace the constructor assignment: ._minServerVersion = 'x.x.x'
+    # This does NOT match: prototype.minServerVersion = function
+    sed -i "s/\._minServerVersion\s*=\s*['\"][0-9.]*['\"]/._minServerVersion = '0.0.0'/g" "$f"
 done
 
-# Patch @jellyfin/sdk: MINIMUM_VERSION
-echo "  - Patching @jellyfin/sdk..."
-find "${JELLYFIN_SRC}/node_modules/@jellyfin/sdk" -name "*.js" -o -name "*.ts" 2>/dev/null | while read f; do
-    if grep -q "MINIMUM_VERSION" "$f" 2>/dev/null; then
-        echo "    Patching: $f"
-        sed -i "s/MINIMUM_VERSION\s*=\s*['\"][0-9.]*['\"]/MINIMUM_VERSION = '0.0.0'/g" "$f"
-    fi
-done
-
-# Also check for version.ts / version.js in sdk
-find "${JELLYFIN_SRC}/node_modules/@jellyfin/sdk" -name "version*" 2>/dev/null | while read f; do
-    echo "    Found version file: $f"
-    sed -i "s/MINIMUM_VERSION\s*=\s*['\"][0-9.]*['\"]/MINIMUM_VERSION = '0.0.0'/g" "$f"
-done
+# --- @jellyfin/sdk ---
+# Patch MINIMUM_VERSION constant
+echo "  - Patching @jellyfin/sdk MINIMUM_VERSION..."
+if [ -d "${JELLYFIN_SRC}/node_modules/@jellyfin/sdk" ]; then
+    find "${JELLYFIN_SRC}/node_modules/@jellyfin/sdk" \( -name "*.js" -o -name "*.ts" \) 2>/dev/null | while read f; do
+        if grep -q "MINIMUM_VERSION" "$f" 2>/dev/null; then
+            echo "    Patching: $f"
+            sed -i "s/MINIMUM_VERSION\s*=\s*['\"][0-9.]*['\"]/MINIMUM_VERSION = '0.0.0'/g" "$f"
+        fi
+    done
+fi
 
 echo "  Version patches applied."
 
