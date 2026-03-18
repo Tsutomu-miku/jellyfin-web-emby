@@ -57,7 +57,7 @@ echo "  - Patching jellyfin-apiclient initial version value..."
 find "${JELLYFIN_SRC}/node_modules" -name "*.js" -path "*jellyfin-apiclient*" \
   -exec grep -l "_minServerVersion" {} \; 2>/dev/null | while read f; do
     echo "    Patching: $f"
-    sed -i "s/\._minServerVersion\s*=\s*['\"][0-9.]*['\"]/.\$_minServerVersion = '0.0.0'/g" "$f"
+    sed -i "s/\._minServerVersion\s*=\s*['\"][0-9.]*['\"]/._minServerVersion = '0.0.0'/g" "$f"
 done
 
 # --- @jellyfin/sdk ---
@@ -66,7 +66,7 @@ if [ -d "${JELLYFIN_SRC}/node_modules/@jellyfin/sdk" ]; then
     find "${JELLYFIN_SRC}/node_modules/@jellyfin/sdk" \( -name "*.js" -o -name "*.ts" \) 2>/dev/null | while read f; do
         if grep -q "MINIMUM_VERSION" "$f" 2>/dev/null; then
             echo "    Patching: $f"
-            sed -i "s/MINIMUM_VERSION\s*=\s*['\"][0-9.]*['\"]/$MINIMUM_VERSION = '0.0.0'/g" "$f"
+            sed -i "s/MINIMUM_VERSION\s*=\s*['\"][0-9.]*['\"]/MINIMUM_VERSION = '0.0.0'/g" "$f"
         fi
     done
 fi
