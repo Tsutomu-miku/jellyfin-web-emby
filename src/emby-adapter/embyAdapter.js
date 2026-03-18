@@ -1,5 +1,5 @@
 /**
- * Emby API Adapter for Jellyfin Web v1.6.2
+ * Emby API Adapter for Jellyfin Web v1.6.3
  * 
  * Based on the stable ce25248 version, with targeted fixes:
  * 1. config.json interception: tells ConnectionManager the real Emby server URL
@@ -15,6 +15,7 @@
  * 11. Emby client UA spoofing: disguises as official Emby Web client to avoid 401 errors (v1.6.1)
  * 12. Correct auth header format: uses MediaBrowser prefix and official client parameters (v1.6.1)
  * 13. CORS preflight fix: skip auth headers & User-Agent on public endpoints to avoid preflight (v1.6.2)
+ * 14. Auth header fix: preserve original DeviceId/Device from Jellyfin Web to maintain session (v1.6.3)
  */
 
 (function() {
@@ -22,7 +23,7 @@
 
     // ==================== Configuration ====================
 
-    const ADAPTER_VERSION = '1.6.2';
+    const ADAPTER_VERSION = '1.6.3';
     const STORAGE_KEY = 'emby_adapter_config';
     const EMBY_TOKEN_KEY = 'emby_access_token';
     const EMBY_USER_KEY = 'emby_user_id';
@@ -511,12 +512,27 @@
     // ==================== Auth Header Helpers ====================
 
     function buildEmbyAuthHeaderValue(token) {
-        const deviceId = localStorage.getItem('emby_device_id') ||
+        // v1.6.3: Use the same DeviceId that Jellyfin Web uses for login,
+        // so the session on the Emby server stays valid.
+        // Jellyfin Web stores its DeviceId in localStorage under '_deviceId2'.
+        const jellyfinDeviceId = localStorage.getItem('_deviceId2');
+        const fallbackDeviceId = localStorage.getItem('emby_device_id') ||
                         ('emby-web-' + Math.random().toString(36).substr(2, 9));
-        localStorage.setItem('emby_device_id', deviceId);
+        if (!localStorage.getItem('emby_device_id')) {
+            localStorage.setItem('emby_device_id', fallbackDeviceId);
+        }
+        const deviceId = jellyfinDeviceId || fallbackDeviceId;
 
-        // Correct MediaBrowser format expected by Emby servers
-        let value = 'MediaBrowser Client="Emby Web", Device="Chrome", DeviceId="' + deviceId + '", Version="4.8.8.0"';
+        // Detect browser for Device field
+        const ua = navigator.userAgent;
+        const browser = ua.includes('Chrome') ? 'Chrome' :
+                       ua.includes('Firefox') ? 'Firefox' :
+                       ua.includes('Safari') ? 'Safari' : 'Browser';
+
+        // Use MediaBrowser prefix (accepted by Emby servers)
+        // Keep Client/Device/Version consistent with what Jellyfin Web sent during login
+        let value = 'MediaBrowser Client="Jellyfin Web", Device="' + browser +
+                   '", DeviceId="' + deviceId + '", Version="10.10.7"';
 
         if (token) {
             value += ', Token="' + token + '"';
@@ -527,14 +543,18 @@
     function transformAuthHeader(value) {
         if (!value) return value;
         let transformed = value;
-        if (transformed.startsWith('MediaBrowser ') || transformed.startsWith('Emby ') || transformed.startsWith('Jellyfin ')) {
-            // Keep existing MediaBrowser prefix but ensure we use the correct format
-            const tokenMatch = value.match(/Token\s*=\s*["']?([^"']+)["']?/i);
-            if (tokenMatch) {
-                transformed = buildEmbyAuthHeaderValue(tokenMatch[1]);
-            } else {
-                transformed = buildEmbyAuthHeaderValue(embyAccessToken);
-            }
+
+        // v1.6.3: Only do minimal prefix conversion.
+        // PRESERVE the original DeviceId, Device, Client, and Version fields
+        // so the Emby server can match the session established during login.
+        // Replacing these values (as v1.6.1 did) causes DeviceId mismatch → 401 → redirect to server selection.
+        if (transformed.startsWith('Jellyfin ')) {
+            // Jellyfin prefix → MediaBrowser prefix (Emby accepts both MediaBrowser and Emby)
+            transformed = 'MediaBrowser ' + transformed.substring('Jellyfin '.length);
+        }
+        // Ensure token is present if we have one
+        if (embyAccessToken && !transformed.includes('Token=')) {
+            transformed += ', Token="' + embyAccessToken + '"';
         }
         return transformed;
     }
