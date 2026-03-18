@@ -3,6 +3,7 @@
  * 
  * Intercepts all network requests from Jellyfin Web and translates them
  * for Emby server compatibility. Handles:
+ * - URL rewriting: redirect API calls from GitHub Pages origin to Emby server
  * - URL prefix (/emby/) injection
  * - Auth header translation (MediaBrowser -> Emby)
  * - CORS-safe headers (only standard Authorization, no X-Emby-*)
@@ -18,7 +19,7 @@
     // Configuration
     // ========================================
 
-    const ADAPTER_VERSION = '1.3.0';
+    const ADAPTER_VERSION = '1.4.0';
     let DEBUG = localStorage.getItem('embyAdapterDebug') === 'true';
 
     const SPOOFED_JELLYFIN_VERSION = '10.10.7';
@@ -27,6 +28,23 @@
     const VERSION_SPOOF_PATHS = [
         '/system/info/public',
         '/system/info',
+    ];
+
+    // Known Jellyfin/Emby API path prefixes (lowercase).
+    // If a request to the SAME origin matches one of these, it is actually
+    // an API call that should be routed to the configured Emby server.
+    const API_PATH_PATTERNS = [
+        '/system/', '/users/', '/items', '/sessions',
+        '/library/', '/branding/', '/displaypreferences',
+        '/playbackinfo', '/livestreams', '/quickconnect',
+        '/mediasources', '/audio/', '/videos/',
+        '/artists', '/genres', '/musicgenres', '/studios',
+        '/persons', '/years', '/channels', '/notifications',
+        '/scheduledtasks', '/packages', '/plugins',
+        '/environment/', '/localization/', '/search/',
+        '/images/', '/web/', '/shows/', '/movies/',
+        '/trailers', '/similar', '/suggestions',
+        '/playback/', '/sync/', '/devices/',
     ];
 
     function log(...args) {
@@ -73,37 +91,58 @@
         } catch { return false; }
     }
 
+    // ========================================
+    // API Path Detection
+    // ========================================
+
     /**
-     * Check whether a URL targets the configured Emby server.
-     * Falls back to detecting any cross-origin request with Emby/Jellyfin API patterns.
+     * Check if a pathname looks like a Jellyfin/Emby API call.
+     * This is used to detect same-origin API requests that should be
+     * routed to the Emby server (e.g. "/System/Info/Public" on GitHub Pages).
+     */
+    function looksLikeApiPath(pathname) {
+        const lp = pathname.toLowerCase();
+        // Already has /emby/ prefix
+        if (lp.startsWith('/emby/') || lp === '/emby') return true;
+        // Match against known API patterns
+        for (const pattern of API_PATH_PATTERNS) {
+            if (lp.startsWith(pattern) || lp.includes(pattern)) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Check whether a URL targets the configured Emby server (or should be routed there).
+     * 
+     * Three detection methods:
+     * 1. URL already points to the configured Emby server origin
+     * 2. URL is cross-origin and path looks like an API call
+     * 3. URL is SAME-origin but path looks like an API call → this means
+     *    ConnectionManager used a relative path that resolved to GitHub Pages
      */
     function isEmbyApiUrl(url) {
         if (!url) return false;
         try {
             const u = new URL(url, window.location.origin);
-
-            // Method 1: match configured server
             const serverUrl = getEmbyServerUrl();
+
+            // Method 1: match configured server origin
             if (serverUrl) {
                 const s = new URL(serverUrl);
                 if (u.hostname === s.hostname && u.port === s.port) return true;
             }
 
-            // Method 2: for cross-origin requests, check if path looks like a Jellyfin/Emby API
-            // This catches requests BEFORE the server is configured (e.g. ConnectionManager auto-connect)
-            if (isCrossOrigin(url)) {
-                const lp = u.pathname.toLowerCase();
-                if (lp.startsWith('/emby/') || lp.startsWith('/emby')) return true;
-                // Common Jellyfin API paths
-                const apiPatterns = [
-                    '/system/info', '/users/', '/items', '/sessions',
-                    '/library/', '/branding/', '/displaypreferences',
-                    '/playbackinfo', '/livestreams', '/quickconnect',
-                    '/mediasources', '/audio/', '/videos/',
-                ];
-                for (const p of apiPatterns) {
-                    if (lp.includes(p)) return true;
-                }
+            // Method 2: cross-origin request with API-like path
+            if (isCrossOrigin(url) && looksLikeApiPath(u.pathname)) {
+                return true;
+            }
+
+            // Method 3: same-origin request with API-like path
+            // This catches the critical case where ConnectionManager builds
+            // relative URLs like "/System/Info/Public" which resolve to the
+            // GitHub Pages origin instead of the Emby server.
+            if (serverUrl && !isCrossOrigin(url) && looksLikeApiPath(u.pathname)) {
+                return true;
             }
         } catch { /* ignore */ }
         return false;
@@ -114,16 +153,39 @@
     // ========================================
 
     /**
-     * Ensure the URL path is prefixed with /emby/ when talking to the Emby server.
+     * Rewrite a URL to point at the configured Emby server with /emby/ prefix.
+     * 
+     * Handles two cases:
+     * 1. Same-origin relative API path → redirect to Emby server
+     * 2. Already cross-origin (Emby server) → just ensure /emby/ prefix
      */
-    function ensureEmbyPrefix(url) {
+    function rewriteUrlForEmby(url) {
         try {
             const u = new URL(url, window.location.origin);
+            const serverUrl = getEmbyServerUrl();
+
+            // If URL is same-origin (GitHub Pages) but looks like an API path,
+            // we need to redirect it to the Emby server
+            if (serverUrl && u.origin === window.location.origin) {
+                const server = new URL(serverUrl);
+                u.protocol = server.protocol;
+                u.hostname = server.hostname;
+                u.port = server.port;
+                log('Redirecting same-origin API call to Emby server:', url, '->', u.toString());
+            }
+
+            // Ensure /emby/ prefix
             if (!u.pathname.toLowerCase().startsWith('/emby/') && !u.pathname.toLowerCase().startsWith('/emby')) {
                 u.pathname = '/emby' + u.pathname;
             }
+
             return u.toString();
         } catch { return url; }
+    }
+
+    // Keep backward compat (used in some places)
+    function ensureEmbyPrefix(url) {
+        return rewriteUrlForEmby(url);
     }
 
     // ========================================
@@ -362,31 +424,39 @@
         let modifiedInit = init ? { ...init } : {};
 
         try {
-            // For ANY cross-origin request, clean up problematic headers
-            if (isCrossOrigin(url)) {
+            const crossOrigin = isCrossOrigin(url);
+            const embyApi = isEmbyApiUrl(url);
+
+            // For ANY cross-origin request OR Emby API request, clean up problematic headers
+            if (crossOrigin || embyApi) {
                 if (modifiedInit.headers) {
                     modifiedInit.headers = transformHeaders(modifiedInit.headers);
                 }
                 // If input is a Request object, we need to rebuild it with clean headers
                 if (input instanceof Request) {
                     const cleanHeaders = transformHeaders(new Headers(input.headers));
-                    // Merge: init headers take precedence over request headers
                     if (!modifiedInit.headers) {
                         modifiedInit.headers = cleanHeaders;
                     }
                 }
             }
 
-            // For Emby API requests specifically, also add /emby/ prefix and do response transforms
-            if (isEmbyApiUrl(url)) {
-                url = ensureEmbyPrefix(url);
-                log('Fetch intercepted:', url);
+            // For Emby API requests, rewrite URL to point at Emby server + /emby/ prefix
+            if (embyApi) {
+                const newUrl = rewriteUrlForEmby(url);
+                log('Fetch intercepted:', url, '->', newUrl);
+                url = newUrl;
 
                 // Reconstruct input with new URL
                 if (typeof input === 'string') {
                     input = url;
                 } else if (input instanceof Request) {
                     input = new Request(url, input);
+                }
+
+                // Ensure headers are cleaned (the URL is now cross-origin)
+                if (modifiedInit.headers) {
+                    modifiedInit.headers = transformHeaders(modifiedInit.headers);
                 }
 
                 // Make the request
@@ -467,14 +537,15 @@
         this._isEmbyApi = isEmbyApiUrl(url);
 
         if (this._isEmbyApi) {
-            url = ensureEmbyPrefix(url);
+            url = rewriteUrlForEmby(url);
+            this._isCrossOrigin = true; // After rewrite, it's definitely cross-origin
             log('XHR intercepted:', method, url);
         }
         return originalXHROpen.call(this, method, url, ...rest);
     };
 
     XMLHttpRequest.prototype.setRequestHeader = function (name, value) {
-        // For ALL cross-origin requests, strip problematic headers
+        // For ALL cross-origin or Emby API requests, strip problematic headers
         if (this._isCrossOrigin || this._isEmbyApi) {
             const lk = name.toLowerCase();
             if (isProblematicHeader(name)) {
@@ -518,6 +589,22 @@
     window.WebSocket = function (url, protocols) {
         if (url) {
             log('WebSocket:', url);
+            // Rewrite WebSocket URL to point at Emby server if needed
+            try {
+                const serverUrl = getEmbyServerUrl();
+                if (serverUrl && !isCrossOrigin(url)) {
+                    // Same-origin WebSocket → redirect to Emby server
+                    const u = new URL(url, window.location.origin);
+                    const s = new URL(serverUrl);
+                    u.protocol = s.protocol === 'https:' ? 'wss:' : 'ws:';
+                    u.hostname = s.hostname;
+                    u.port = s.port;
+                    url = u.toString();
+                    log('WebSocket redirected to:', url);
+                }
+            } catch (e) {
+                warn('WebSocket rewrite error:', e);
+            }
         }
         const ws = new OriginalWebSocket(url, protocols);
         return ws;
