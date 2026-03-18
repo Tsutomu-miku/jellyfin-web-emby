@@ -84,6 +84,25 @@ mkdir -p "${ADAPTER_DEST}"
 cp "${SRC_DIR}/emby-adapter/embyAdapter.js" "${ADAPTER_DEST}/"
 cp "${SRC_DIR}/emby-adapter/index.js" "${ADAPTER_DEST}/"
 
+# ========================================
+# CRITICAL FIX: Ensure embyAdapter.js is treated as an ES module by Babel.
+#
+# embyAdapter.js is an IIFE with no import/export statements. Babel's
+# sourceType:'unambiguous' would classify it as a 'script', but webpack
+# treats it as an ES module (because it is imported via `import` statement).
+# When @babel/preset-env injects core-js polyfills with useBuiltIns:'usage',
+# the mismatch between Babel's script mode (require) and webpack's ESM
+# expectation (import) causes the production build to fail.
+#
+# Appending `export {};` makes Babel recognize the file as an ES module,
+# ensuring polyfill injections use consistent `import` syntax.
+# ========================================
+echo "  Ensuring embyAdapter.js has ES module export for Babel compatibility..."
+if ! grep -q '^export' "${ADAPTER_DEST}/embyAdapter.js"; then
+    printf '\n// Ensure Babel (sourceType: unambiguous) treats this file as an ES module\nexport {};\n' >> "${ADAPTER_DEST}/embyAdapter.js"
+    echo "  Added 'export {};' to embyAdapter.js"
+fi
+
 # Find the main entry point and inject adapter import at the top
 ENTRY_FILE="${JELLYFIN_SRC}/src/index.jsx"
 if [ ! -f "${ENTRY_FILE}" ]; then
