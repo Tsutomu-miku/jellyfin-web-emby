@@ -1,410 +1,469 @@
 /**
- * Jellyfin-Web Emby Adapter v2.0.0
+ * Emby API Adapter for Jellyfin Web v1.2.0
  * 
- * ARCHITECTURE:
+ * Based on the stable ce25248 version, with two targeted fixes:
+ * 1. config.json interception: tells ConnectionManager the real Emby server URL
+ *    (prevents it from using GitHub Pages origin as the server)
+ * 2. Version spoofing: replaces Emby 4.x version with 10.10.7
+ *    (prevents "server needs to be updated" error)
  * 
- * The adapter has TWO distinct phases:
- * 
- * Phase 1 - Pre-login (no server configured):
- *   - index.js shows a login UI overlay
- *   - Adapter intercepts config.json to return the configured server
- *   - Adapter blocks Jellyfin Web from loading until login completes
- * 
- * Phase 2 - Post-login (server configured):
- *   - ConnectionManager connects to the Emby server directly (cross-origin)
- *   - Adapter intercepts ONLY cross-origin requests going to the Emby server
- *   - Handles: CORS headers, /emby/ prefix, version spoofing, auth headers
- *   - Does NOT touch same-origin requests (static files, webpack chunks, etc.)
+ * Key differences handled:
+ * 1. URL prefix: Emby requires /emby/ prefix on API paths
+ * 2. Auth header: Uses "Emby" scheme in standard Authorization header
+ *    (avoids X-Emby-Authorization to prevent CORS preflight issues)
+ * 3. Token passing: Embedded in Authorization header value
  */
 
-(function () {
+(function() {
     'use strict';
 
-    const ADAPTER_VERSION = '2.0.0';
-    let DEBUG = localStorage.getItem('embyAdapterDebug') === 'true';
+    // ==================== Configuration ====================
+
+    const ADAPTER_VERSION = '1.2.0';
+    const STORAGE_KEY = 'emby_adapter_config';
+    const EMBY_TOKEN_KEY = 'emby_access_token';
+    const EMBY_USER_KEY = 'emby_user_id';
+    const EMBY_SERVER_KEY = 'emby_server_url';
     const SPOOFED_VERSION = '10.10.7';
 
+    // Paths that should NOT get the /emby/ prefix (static resources)
+    const STATIC_EXTENSIONS = [
+        '.js', '.css', '.html', '.htm', '.woff', '.woff2', '.ttf',
+        '.eot', '.svg', '.png', '.jpg', '.jpeg', '.gif', '.ico',
+        '.map', '.json', '.webp', '.avif'
+    ];
+
+    // ==================== State ====================
+
+    let embyServerUrl = localStorage.getItem(EMBY_SERVER_KEY) || '';
+    let embyAccessToken = localStorage.getItem(EMBY_TOKEN_KEY) || '';
+    let embyUserId = localStorage.getItem(EMBY_USER_KEY) || '';
+    let adapterEnabled = true;
+
+    // ==================== Helpers ====================
+
     function log(...args) {
-        if (DEBUG) console.log('[EmbyAdapter]', ...args);
+        if (localStorage.getItem('emby_adapter_debug') === 'true') {
+            console.log('[EmbyAdapter]', ...args);
+        }
     }
+
     function warn(...args) {
         console.warn('[EmbyAdapter]', ...args);
     }
 
-    log(`v${ADAPTER_VERSION} initializing...`);
-
-    // ========================================
-    // Configuration Store
-    // ========================================
-
-    const CONFIG_KEY = 'embyAdapterConfig';
-    const CREDS_KEY = 'jellyfin_credentials';
-
-    function getConfig() {
-        try { return JSON.parse(localStorage.getItem(CONFIG_KEY) || '{}'); } 
-        catch { return {}; }
-    }
-
-    function getServerUrl() {
-        const cfg = getConfig();
-        return cfg.serverUrl || '';
-    }
-
-    function getToken() {
-        const cfg = getConfig();
-        return cfg.token || '';
-    }
-
-    // ========================================
-    // Request Classification
-    // ========================================
-
-    /**
-     * Check if a URL points to the configured Emby server.
-     * This is the ONLY condition under which we modify requests.
-     * Same-origin requests are NEVER modified.
-     */
-    function isEmbyServerRequest(url) {
-        const serverUrl = getServerUrl();
-        if (!serverUrl || !url) return false;
-        try {
-            const reqUrl = new URL(url, window.location.origin);
-            const srvUrl = new URL(serverUrl);
-            return reqUrl.hostname === srvUrl.hostname && 
-                   (reqUrl.port || '') === (srvUrl.port || '');
-        } catch { return false; }
-    }
-
     /**
      * Check if a URL is a same-origin config.json request.
-     * We intercept this to inject the Emby server address.
+     * We intercept this to inject the Emby server address so that
+     * ConnectionManager connects to the real server, not GitHub Pages.
      */
     function isConfigJsonRequest(url) {
         try {
             const u = new URL(url, window.location.origin);
-            return u.origin === window.location.origin && 
+            return u.origin === window.location.origin &&
                    u.pathname.endsWith('/config.json');
-        } catch { return false; }
+        } catch (e) {
+            return false;
+        }
     }
-
-    // ========================================
-    // URL Transformation
-    // ========================================
 
     /**
-     * Add /emby/ prefix to path if not already present.
+     * Check if a URL points to the Emby server (API request vs static resource)
      */
-    function addEmbyPrefix(url) {
+    function isEmbyApiRequest(url) {
+        if (!embyServerUrl) return false;
+
         try {
-            const u = new URL(url);
-            const lp = u.pathname.toLowerCase();
-            if (!lp.startsWith('/emby/') && !lp.startsWith('/emby')) {
-                u.pathname = '/emby' + u.pathname;
+            const parsed = new URL(url, window.location.origin);
+            const serverParsed = new URL(embyServerUrl);
+
+            // Must be same origin as Emby server (includes port check)
+            if (parsed.hostname !== serverParsed.hostname) return false;
+            if ((parsed.port || '') !== (serverParsed.port || '')) return false;
+
+            // Static resources don't need adaptation
+            const pathname = parsed.pathname.toLowerCase();
+            for (const ext of STATIC_EXTENSIONS) {
+                if (pathname.endsWith(ext)) return false;
             }
-            return u.toString();
-        } catch { return url; }
+
+            // Already has /emby/ prefix - still an Emby API request, just don't double-add
+            return true;
+        } catch (e) {
+            return false;
+        }
     }
 
-    // ========================================
-    // Version Spoofing
-    // ========================================
-
+    /**
+     * Check if response needs version spoofing.
+     * Applies to /System/Info/Public and /System/Info endpoints.
+     */
     function needsVersionSpoof(url) {
         try {
-            const lp = new URL(url).pathname.toLowerCase();
-            return lp.endsWith('/system/info/public') || 
-                   lp.endsWith('/system/info') ||
-                   lp.endsWith('/emby/system/info/public') || 
-                   lp.endsWith('/emby/system/info');
-        } catch { return false; }
+            const pathname = new URL(url).pathname.toLowerCase();
+            return pathname.endsWith('/system/info/public') ||
+                   pathname.endsWith('/system/info') ||
+                   pathname.endsWith('/emby/system/info/public') ||
+                   pathname.endsWith('/emby/system/info');
+        } catch (e) {
+            return false;
+        }
     }
 
-    function spoofVersion(bodyText) {
+    /**
+     * Replace version in JSON response body.
+     * Emby reports 4.x which fails Jellyfin's >= 10.9.0 check.
+     */
+    function spoofVersionInJson(bodyText) {
         try {
             const data = JSON.parse(bodyText);
-            if (data && typeof data === 'object') {
-                const orig = data.Version;
+            if (data && typeof data.Version === 'string') {
+                log('Spoofing version:', data.Version, '->', SPOOFED_VERSION);
                 data.Version = SPOOFED_VERSION;
-                data.ProductName = data.ProductName || 'Jellyfin Server';
-                log('Spoofed version:', orig, '->', SPOOFED_VERSION);
+                // Also ensure ProductName looks like Jellyfin
+                if (!data.ProductName || data.ProductName.toLowerCase().includes('emby')) {
+                    data.ProductName = 'Jellyfin Server';
+                }
                 return JSON.stringify(data);
             }
-        } catch (e) { warn('Version spoof error:', e); }
+        } catch (e) {
+            warn('Version spoof parse error:', e);
+        }
         return bodyText;
     }
 
-    // ========================================
-    // Auth Header Helpers
-    // ========================================
-
-    function buildEmbyAuth(originalValue) {
-        if (!originalValue) return originalValue;
-        let v = originalValue;
-        if (v.startsWith('MediaBrowser ')) v = 'Emby ' + v.substring(13);
-        else if (v.startsWith('Jellyfin ')) v = 'Emby ' + v.substring(9);
-
-        const token = getToken();
-        if (token && !v.includes('Token=')) {
-            v = v.replace(/\s*$/, '') + ', Token="' + token + '"';
+    /**
+     * Add /emby/ prefix to API path
+     */
+    function addEmbyPrefix(url) {
+        try {
+            const parsed = new URL(url);
+            if (!parsed.pathname.toLowerCase().startsWith('/emby/') &&
+                !parsed.pathname.toLowerCase().startsWith('/emby')) {
+                parsed.pathname = '/emby' + parsed.pathname;
+            }
+            return parsed.toString();
+        } catch (e) {
+            // Relative URL
+            if (!url.startsWith('/emby/')) {
+                return '/emby' + (url.startsWith('/') ? url : '/' + url);
+            }
+            return url;
         }
-        return v;
-    }
-
-    function isProblematicHeader(name) {
-        const lk = name.toLowerCase();
-        return lk.startsWith('x-emby-') || lk.startsWith('x-mediabrowser-');
     }
 
     /**
-     * Clean headers for CORS safety: strip X-Emby-*, fold auth into Authorization.
+     * Build the Emby auth header value.
+     * Uses the standard "Authorization" header ONLY (not X-Emby-Authorization)
+     * to avoid CORS preflight issues.
      */
-    function cleanHeaders(headers) {
-        if (!headers) return headers;
+    function buildEmbyAuthHeaderValue(token) {
+        const deviceId = localStorage.getItem('emby_device_id') ||
+                        ('emby-web-' + Math.random().toString(36).substr(2, 9));
+        localStorage.setItem('emby_device_id', deviceId);
 
+        const browser = navigator.userAgent.includes('Chrome') ? 'Chrome' :
+                       navigator.userAgent.includes('Firefox') ? 'Firefox' :
+                       navigator.userAgent.includes('Safari') ? 'Safari' : 'Browser';
+
+        let value = 'Emby Client="Jellyfin Web (Emby)", Device="' + browser +
+                   '", DeviceId="' + deviceId + '", Version="' + ADAPTER_VERSION + '"';
+
+        if (token) {
+            value += ', Token="' + token + '"';
+        }
+
+        return value;
+    }
+
+    /**
+     * Transform Jellyfin auth header to Emby format.
+     * Replaces MediaBrowser/Jellyfin prefix with Emby.
+     */
+    function transformAuthHeader(value) {
+        if (!value) return value;
+
+        let transformed = value;
+        if (transformed.startsWith('MediaBrowser ')) {
+            transformed = 'Emby ' + transformed.substring('MediaBrowser '.length);
+        } else if (transformed.startsWith('Jellyfin ')) {
+            transformed = 'Emby ' + transformed.substring('Jellyfin '.length);
+        }
+
+        // If we have a token and it's not in the header, add it
+        if (embyAccessToken && !transformed.includes('Token=')) {
+            transformed += ', Token="' + embyAccessToken + '"';
+        }
+
+        return transformed;
+    }
+
+    /**
+     * Transform request headers for Emby compatibility.
+     * CORS strategy: ONLY use standard headers (Authorization, Content-Type).
+     */
+    function transformHeaders(headers) {
+        const newHeaders = new Headers();
+        let authValue = null;
+
+        // Handle various header input types
+        const entries = [];
         if (headers instanceof Headers) {
-            const h = new Headers();
-            for (const [key, value] of headers.entries()) {
-                const lk = key.toLowerCase();
-                if (isProblematicHeader(key)) {
-                    if (lk === 'x-emby-authorization' || lk === 'x-mediabrowser-token') {
-                        h.set('Authorization', buildEmbyAuth(value));
+            headers.forEach((value, key) => entries.push([key, value]));
+        } else if (Array.isArray(headers)) {
+            entries.push(...headers);
+        } else if (headers && typeof headers === 'object') {
+            Object.entries(headers).forEach(([key, value]) => entries.push([key, value]));
+        }
+
+        for (const [key, value] of entries) {
+            const lowerKey = key.toLowerCase();
+
+            // Skip any X-Emby-* / X-MediaBrowser-* custom headers for CORS safety
+            if (lowerKey.startsWith('x-emby-') || lowerKey.startsWith('x-mediabrowser-')) {
+                // Extract token if present in custom header
+                if ((lowerKey === 'x-emby-token' || lowerKey === 'x-mediabrowser-token') && value) {
+                    if (!embyAccessToken) {
+                        embyAccessToken = value;
+                        localStorage.setItem(EMBY_TOKEN_KEY, value);
                     }
-                    continue; // drop
                 }
-                if (lk === 'authorization') {
-                    h.set('Authorization', buildEmbyAuth(value));
-                    continue;
+                // If X-Emby-Authorization, use it as the base for our Authorization header
+                if (lowerKey === 'x-emby-authorization') {
+                    authValue = transformAuthHeader(value);
                 }
-                h.set(key, value);
+                continue; // Don't copy this header
             }
-            return h;
-        }
 
-        if (typeof headers === 'object' && !Array.isArray(headers)) {
-            const result = {};
-            for (const [key, value] of Object.entries(headers)) {
-                const lk = key.toLowerCase();
-                if (isProblematicHeader(key)) {
-                    if (lk === 'x-emby-authorization' || lk === 'x-mediabrowser-token') {
-                        result['Authorization'] = buildEmbyAuth(value);
-                    }
-                    continue;
-                }
-                if (lk === 'authorization') {
-                    result['Authorization'] = buildEmbyAuth(value);
-                    continue;
-                }
-                result[key] = value;
+            if (lowerKey === 'authorization') {
+                authValue = transformAuthHeader(value);
+            } else {
+                newHeaders.set(key, value);
             }
-            return result;
         }
 
-        return headers;
+        // Set the Authorization header
+        if (authValue) {
+            newHeaders.set('Authorization', authValue);
+        } else if (embyAccessToken) {
+            newHeaders.set('Authorization', buildEmbyAuthHeaderValue(embyAccessToken));
+        }
+
+        return newHeaders;
     }
 
-    // ========================================
-    // Response Transformers
-    // ========================================
-
-    function transformUserData(data) {
-        if (!data) return data;
-        if (data.Policy) {
-            data.Policy = {
-                ...data.Policy,
-                IsAdministrator: data.Policy.IsAdministrator ?? data.Policy.IsAdmin ?? false,
-                EnableAllFolders: data.Policy.EnableAllFolders ?? true,
-                EnableAllChannels: data.Policy.EnableAllChannels ?? true,
-            };
+    /**
+     * Handle authentication response - extract and store token
+     */
+    function handleAuthResponse(url, response) {
+        if (typeof url === 'string' && url.includes('/Users/AuthenticateByName')) {
+            const cloned = response.clone();
+            cloned.json().then(data => {
+                if (data && data.AccessToken) {
+                    embyAccessToken = data.AccessToken;
+                    embyUserId = data.User ? data.User.Id : '';
+                    localStorage.setItem(EMBY_TOKEN_KEY, embyAccessToken);
+                    localStorage.setItem(EMBY_USER_KEY, embyUserId);
+                    log('Authentication successful, token stored');
+                }
+            }).catch(e => {
+                log('Failed to parse auth response:', e);
+            });
         }
-        return data;
+
+        if (typeof url === 'string' && url.includes('/Sessions/Logout')) {
+            embyAccessToken = '';
+            embyUserId = '';
+            localStorage.removeItem(EMBY_TOKEN_KEY);
+            localStorage.removeItem(EMBY_USER_KEY);
+            log('Logged out, token cleared');
+        }
     }
-
-    function transformItem(item) {
-        if (!item) return item;
-        if (item.UserData) {
-            item.UserData = {
-                ...item.UserData,
-                PlaybackPositionTicks: item.UserData.PlaybackPositionTicks || 0,
-                PlayCount: item.UserData.PlayCount || 0,
-                IsFavorite: item.UserData.IsFavorite ?? false,
-                Played: item.UserData.Played ?? false,
-            };
-        }
-        if (item.MediaSources && Array.isArray(item.MediaSources)) {
-            item.MediaSources = item.MediaSources.map(s => ({
-                ...s,
-                SupportsTranscoding: s.SupportsTranscoding ?? true,
-                SupportsDirectStream: s.SupportsDirectStream ?? true,
-                SupportsDirectPlay: s.SupportsDirectPlay ?? true,
-            }));
-        }
-        return item;
-    }
-
-    // ========================================
-    // Config.json Interceptor
-    // ========================================
 
     /**
      * Generate a synthetic config.json response.
-     * This tells Jellyfin Web where the server is.
+     * This tells ConnectionManager where the Emby server is,
+     * preventing it from falling back to window.location.origin (GitHub Pages).
      */
     function createConfigJsonResponse() {
-        const serverUrl = getServerUrl();
         const config = {};
-
-        if (serverUrl) {
-            // Tell Jellyfin Web to connect to this server
-            config.servers = [serverUrl];
+        if (embyServerUrl) {
+            config.servers = [embyServerUrl];
         }
-
-        // Standard Jellyfin Web config
         config.menuLinks = [];
         config.multiserver = false;
+
+        log('config.json intercepted, servers:', config.servers || '(none)');
 
         return new Response(JSON.stringify(config), {
             status: 200,
             statusText: 'OK',
-            headers: { 'Content-Type': 'application/json' },
+            headers: { 'Content-Type': 'application/json' }
         });
     }
 
-    // ========================================
-    // Fetch Interceptor
-    // ========================================
+    // ==================== Fetch Interceptor ====================
 
     const originalFetch = window.fetch;
 
-    window.fetch = async function (input, init) {
-        let url = typeof input === 'string' ? input : (input instanceof Request ? input.url : String(input));
-        let modifiedInit = init ? { ...init } : {};
+    window.fetch = function(input, init) {
+        if (!adapterEnabled) {
+            return originalFetch.call(this, input, init);
+        }
 
-        try {
-            // ---- Intercept config.json to inject server address ----
-            if (isConfigJsonRequest(url)) {
-                log('Intercepting config.json, injecting server:', getServerUrl());
-                return createConfigJsonResponse();
+        let url;
+        let options = init || {};
+
+        if (input instanceof Request) {
+            url = input.url;
+            if (!init) {
+                options = {
+                    method: input.method,
+                    headers: input.headers,
+                    body: input.body,
+                    mode: input.mode,
+                    credentials: input.credentials,
+                    cache: input.cache,
+                    redirect: input.redirect,
+                    referrer: input.referrer,
+                    integrity: input.integrity
+                };
             }
+        } else {
+            url = String(input);
+        }
 
-            // ---- Only modify requests going to the Emby server ----
-            if (isEmbyServerRequest(url)) {
-                // Clean CORS-problematic headers
-                if (modifiedInit.headers) {
-                    modifiedInit.headers = cleanHeaders(modifiedInit.headers);
+        // ---- Intercept config.json ----
+        if (isConfigJsonRequest(url)) {
+            return Promise.resolve(createConfigJsonResponse());
+        }
+
+        // ---- Only modify requests going to the Emby server ----
+        if (!isEmbyApiRequest(url)) {
+            // For ANY cross-origin request, still strip X-Emby-* headers for CORS safety
+            try {
+                const reqUrl = new URL(url, window.location.origin);
+                if (reqUrl.origin !== window.location.origin && options.headers) {
+                    const newHeaders = transformHeaders(options.headers);
+                    options = { ...options, headers: newHeaders };
                 }
-                if (input instanceof Request) {
-                    const cleaned = cleanHeaders(new Headers(input.headers));
-                    if (!modifiedInit.headers) modifiedInit.headers = cleaned;
-                }
+            } catch (e) {}
+            return originalFetch.call(this, input instanceof Request ? input : url, options);
+        }
 
-                // Add /emby/ prefix
-                url = addEmbyPrefix(url);
-                log('Fetch:', url);
+        log('Intercepting fetch:', url);
 
-                // Rebuild input
-                if (typeof input === 'string') {
-                    input = url;
-                } else if (input instanceof Request) {
-                    input = new Request(url, input);
-                }
+        // Transform URL: add /emby/ prefix
+        const newUrl = addEmbyPrefix(url);
 
-                // Execute request
-                const response = await originalFetch.call(this, input, modifiedInit);
+        // Transform headers
+        const newHeaders = transformHeaders(options.headers);
 
-                // Version spoofing
-                if (needsVersionSpoof(url) && response.ok) {
-                    const text = await response.clone().text();
-                    return new Response(spoofVersion(text), {
+        const newOptions = {
+            ...options,
+            headers: newHeaders
+        };
+
+        log('Adapted to:', newUrl);
+
+        return originalFetch.call(this, newUrl, newOptions).then(response => {
+            // Handle auth responses
+            handleAuthResponse(url, response);
+
+            // Version spoofing for System/Info endpoints
+            if (needsVersionSpoof(newUrl) && response.ok) {
+                return response.clone().text().then(bodyText => {
+                    const spoofed = spoofVersionInJson(bodyText);
+                    return new Response(spoofed, {
                         status: response.status,
                         statusText: response.statusText,
-                        headers: response.headers,
+                        headers: response.headers
                     });
-                }
+                });
+            }
 
-                // JSON response transformations
-                if (response.ok) {
-                    const ct = response.headers.get('content-type');
-                    if (ct && ct.includes('application/json')) {
-                        const lp = new URL(url).pathname.toLowerCase();
-                        if (lp.includes('/users/') || lp.includes('/items')) {
-                            try {
-                                let data = await response.clone().json();
-                                if (lp.includes('/users/')) data = transformUserData(data);
-                                if (data.Items) data.Items = data.Items.map(transformItem);
-                                else if (lp.includes('/items')) data = transformItem(data);
-                                return new Response(JSON.stringify(data), {
-                                    status: response.status,
-                                    statusText: response.statusText,
-                                    headers: response.headers,
-                                });
-                            } catch { /* use original */ }
-                        }
+            return response;
+        });
+    };
+
+    // ==================== XMLHttpRequest Interceptor ====================
+
+    const XHROpen = XMLHttpRequest.prototype.open;
+    const XHRSetHeader = XMLHttpRequest.prototype.setRequestHeader;
+    const XHRSend = XMLHttpRequest.prototype.send;
+
+    XMLHttpRequest.prototype.open = function(method, url, async, user, password) {
+        this._embyOriginalUrl = url;
+        this._embyMethod = method;
+        this._embyHeaders = {};
+        this._embyAdapted = false;
+        this._embyIsConfigJson = false;
+
+        let adaptedUrl = url;
+
+        // Check config.json first
+        if (adapterEnabled && isConfigJsonRequest(String(url))) {
+            this._embyIsConfigJson = true;
+            // Don't actually open the request, we'll fake it in send()
+            return XHROpen.call(this, method, adaptedUrl, async !== false, user, password);
+        }
+
+        if (adapterEnabled && isEmbyApiRequest(String(url))) {
+            adaptedUrl = addEmbyPrefix(String(url));
+            this._embyAdapted = true;
+            log('XHR Intercepting:', url, '->', adaptedUrl);
+        }
+
+        return XHROpen.call(this, method, adaptedUrl, async !== false, user, password);
+    };
+
+    XMLHttpRequest.prototype.setRequestHeader = function(name, value) {
+        if (this._embyAdapted) {
+            const lowerName = name.toLowerCase();
+
+            // Skip custom Emby headers for CORS safety
+            if (lowerName.startsWith('x-emby-') || lowerName.startsWith('x-mediabrowser-')) {
+                if ((lowerName === 'x-emby-token' || lowerName === 'x-mediabrowser-token') && value) {
+                    if (!embyAccessToken) {
+                        embyAccessToken = value;
+                        localStorage.setItem(EMBY_TOKEN_KEY, value);
                     }
                 }
-
-                return response;
-            }
-        } catch (error) {
-            warn('Fetch error:', error);
-        }
-
-        // Not an Emby request — pass through unmodified
-        return originalFetch.call(this, input, modifiedInit);
-    };
-
-    // ========================================
-    // XHR Interceptor
-    // ========================================
-
-    const origOpen = XMLHttpRequest.prototype.open;
-    const origSetHeader = XMLHttpRequest.prototype.setRequestHeader;
-    const origSend = XMLHttpRequest.prototype.send;
-
-    XMLHttpRequest.prototype.open = function (method, url, ...rest) {
-        this._adapterUrl = url;
-        this._isEmbyReq = isEmbyServerRequest(url);
-        this._isConfigJson = isConfigJsonRequest(url);
-
-        if (this._isEmbyReq) {
-            url = addEmbyPrefix(url);
-            log('XHR:', method, url);
-        }
-
-        return origOpen.call(this, method, url, ...rest);
-    };
-
-    XMLHttpRequest.prototype.setRequestHeader = function (name, value) {
-        if (this._isEmbyReq) {
-            const lk = name.toLowerCase();
-            if (isProblematicHeader(name)) {
-                if (lk === 'x-emby-authorization') {
-                    return origSetHeader.call(this, 'Authorization', buildEmbyAuth(value));
+                if (lowerName === 'x-emby-authorization') {
+                    const transformed = transformAuthHeader(value);
+                    this._embyHeaders['Authorization'] = transformed;
+                    return XHRSetHeader.call(this, 'Authorization', transformed);
                 }
-                log('Stripped XHR header:', name);
-                return; // drop
+                return; // Don't send this header
             }
-            if (lk === 'authorization') {
-                return origSetHeader.call(this, 'Authorization', buildEmbyAuth(value));
+
+            if (lowerName === 'authorization') {
+                const transformed = transformAuthHeader(value);
+                this._embyHeaders['Authorization'] = transformed;
+                return XHRSetHeader.call(this, 'Authorization', transformed);
             }
         }
-        return origSetHeader.call(this, name, value);
+        this._embyHeaders[name] = value;
+        return XHRSetHeader.call(this, name, value);
     };
 
-    XMLHttpRequest.prototype.send = function (...args) {
-        // Handle config.json interception for XHR
-        if (this._isConfigJson) {
+    XMLHttpRequest.prototype.send = function(body) {
+        // Handle config.json interception
+        if (this._embyIsConfigJson) {
             const self = this;
-            setTimeout(() => {
-                const configData = JSON.stringify({
-                    servers: getServerUrl() ? [getServerUrl()] : [],
-                    menuLinks: [],
-                    multiserver: false,
-                });
-                Object.defineProperty(self, 'readyState', { value: 4, writable: false });
-                Object.defineProperty(self, 'status', { value: 200, writable: false });
-                Object.defineProperty(self, 'statusText', { value: 'OK', writable: false });
-                Object.defineProperty(self, 'responseText', { value: configData, writable: false });
-                Object.defineProperty(self, 'response', { value: configData, writable: false });
+            const configData = JSON.stringify({
+                servers: embyServerUrl ? [embyServerUrl] : [],
+                menuLinks: [],
+                multiserver: false
+            });
+            log('XHR config.json intercepted');
+            setTimeout(function() {
+                // Fake a successful response
+                Object.defineProperty(self, 'readyState', { value: 4, writable: false, configurable: true });
+                Object.defineProperty(self, 'status', { value: 200, writable: false, configurable: true });
+                Object.defineProperty(self, 'statusText', { value: 'OK', writable: false, configurable: true });
+                Object.defineProperty(self, 'responseText', { value: configData, writable: false, configurable: true });
+                Object.defineProperty(self, 'response', { value: configData, writable: false, configurable: true });
                 if (typeof self.onreadystatechange === 'function') {
                     self.onreadystatechange();
                 }
@@ -415,183 +474,283 @@
             return;
         }
 
-        // Version spoofing for Emby server responses
-        if (this._isEmbyReq && needsVersionSpoof(this._adapterUrl)) {
-            this.addEventListener('readystatechange', function () {
-                if (this.readyState === 4 && this.status === 200) {
+        if (this._embyAdapted) {
+            // Add auth header if missing
+            if (embyAccessToken && !this._embyHeaders['Authorization']) {
+                const authValue = buildEmbyAuthHeaderValue(embyAccessToken);
+                XHRSetHeader.call(this, 'Authorization', authValue);
+            }
+
+            // Version spoofing for System/Info
+            if (needsVersionSpoof(this._embyOriginalUrl)) {
+                this.addEventListener('readystatechange', function() {
+                    if (this.readyState === 4 && this.status === 200) {
+                        try {
+                            const spoofed = spoofVersionInJson(this.responseText);
+                            Object.defineProperty(this, 'responseText', { value: spoofed, writable: false, configurable: true });
+                            Object.defineProperty(this, 'response', { value: spoofed, writable: false, configurable: true });
+                        } catch (e) {
+                            warn('XHR version spoof error:', e);
+                        }
+                    }
+                });
+            }
+
+            // Listen for auth responses
+            this.addEventListener('load', function() {
+                if (this._embyOriginalUrl && this._embyOriginalUrl.includes('/Users/AuthenticateByName')) {
                     try {
-                        const spoofed = spoofVersion(this.responseText);
-                        Object.defineProperty(this, 'responseText', { value: spoofed, writable: false });
-                        Object.defineProperty(this, 'response', { value: spoofed, writable: false });
-                    } catch (e) { warn('XHR spoof error:', e); }
+                        const data = JSON.parse(this.responseText);
+                        if (data && data.AccessToken) {
+                            embyAccessToken = data.AccessToken;
+                            embyUserId = data.User ? data.User.Id : '';
+                            localStorage.setItem(EMBY_TOKEN_KEY, embyAccessToken);
+                            localStorage.setItem(EMBY_USER_KEY, embyUserId);
+                            log('XHR Auth successful, token stored');
+                        }
+                    } catch (e) {}
                 }
             });
+
+            return XHRSend.call(this, body);
         }
 
-        return origSend.apply(this, args);
+        return XHRSend.call(this, body);
     };
 
-    // ========================================
-    // WebSocket Patch
-    // ========================================
+    // ==================== Image URL Adapter ====================
 
-    const OrigWS = window.WebSocket;
+    function setupImageObserver() {
+        if (!embyServerUrl) return;
 
-    window.WebSocket = function (url, protocols) {
-        const serverUrl = getServerUrl();
-        if (serverUrl && url) {
-            try {
-                const u = new URL(url, window.location.origin);
-                const s = new URL(serverUrl);
-                // Redirect WebSocket to Emby server if it's pointing at same-origin
-                if (u.hostname === window.location.hostname) {
-                    u.protocol = s.protocol === 'https:' ? 'wss:' : 'ws:';
-                    u.hostname = s.hostname;
-                    u.port = s.port;
-                    url = u.toString();
-                    log('WebSocket redirected:', url);
+        const observer = new MutationObserver(mutations => {
+            for (const mutation of mutations) {
+                for (const node of mutation.addedNodes) {
+                    if (node.nodeType === Node.ELEMENT_NODE) {
+                        adaptImageUrls(node);
+                    }
                 }
-            } catch (e) { warn('WS error:', e); }
+            }
+        });
+
+        observer.observe(document.documentElement, {
+            childList: true,
+            subtree: true
+        });
+
+        document.querySelectorAll('img').forEach(adaptImageElement);
+    }
+
+    function adaptImageUrls(element) {
+        if (element.tagName === 'IMG') {
+            adaptImageElement(element);
         }
-        return new OrigWS(url, protocols);
+        element.querySelectorAll && element.querySelectorAll('img').forEach(adaptImageElement);
+    }
+
+    function adaptImageElement(img) {
+        const src = img.getAttribute('src');
+        if (!src || !embyServerUrl || !embyAccessToken) return;
+
+        try {
+            const srcUrl = new URL(src, window.location.origin);
+            const serverUrl = new URL(embyServerUrl);
+
+            if (srcUrl.origin === serverUrl.origin && !srcUrl.searchParams.has('api_key')) {
+                if (!srcUrl.pathname.startsWith('/emby/')) {
+                    srcUrl.pathname = '/emby' + srcUrl.pathname;
+                }
+                srcUrl.searchParams.set('api_key', embyAccessToken);
+                img.setAttribute('src', srcUrl.toString());
+            }
+        } catch (e) {}
+    }
+
+    // ==================== WebSocket Adapter ====================
+
+    const OriginalWebSocket = window.WebSocket;
+
+    window.WebSocket = function(url, protocols) {
+        if (adapterEnabled && embyServerUrl) {
+            try {
+                const wsUrl = new URL(url);
+                const serverUrl = new URL(embyServerUrl);
+
+                // If WebSocket is going to same-origin (GitHub Pages), redirect to Emby server
+                if (wsUrl.hostname === window.location.hostname) {
+                    wsUrl.protocol = serverUrl.protocol === 'https:' ? 'wss:' : 'ws:';
+                    wsUrl.hostname = serverUrl.hostname;
+                    wsUrl.port = serverUrl.port;
+                    log('WebSocket redirected to Emby server:', wsUrl.toString());
+                }
+
+                // If WebSocket is going to the Emby server
+                if (wsUrl.hostname === serverUrl.hostname &&
+                    (wsUrl.port || '') === (serverUrl.port || '')) {
+                    // Add /emby prefix if needed
+                    if (!wsUrl.pathname.startsWith('/emby')) {
+                        wsUrl.pathname = '/emby' + wsUrl.pathname;
+                    }
+                    // Add api_key parameter
+                    if (embyAccessToken && !wsUrl.searchParams.has('api_key')) {
+                        wsUrl.searchParams.set('api_key', embyAccessToken);
+                    }
+                    log('WebSocket adapted:', url, '->', wsUrl.toString());
+                    url = wsUrl.toString();
+                }
+            } catch (e) {
+                log('WebSocket URL parse error:', e);
+            }
+        }
+        return new OriginalWebSocket(url, protocols);
     };
-    window.WebSocket.CONNECTING = OrigWS.CONNECTING;
-    window.WebSocket.OPEN = OrigWS.OPEN;
-    window.WebSocket.CLOSING = OrigWS.CLOSING;
-    window.WebSocket.CLOSED = OrigWS.CLOSED;
-    window.WebSocket.prototype = OrigWS.prototype;
+    window.WebSocket.prototype = OriginalWebSocket.prototype;
+    window.WebSocket.CONNECTING = OriginalWebSocket.CONNECTING;
+    window.WebSocket.OPEN = OriginalWebSocket.OPEN;
+    window.WebSocket.CLOSING = OriginalWebSocket.CLOSING;
+    window.WebSocket.CLOSED = OriginalWebSocket.CLOSED;
 
-    // ========================================
-    // UI Patches
-    // ========================================
-
-    function applyUIPatches() {
-        const apply = () => {
-            const style = document.createElement('style');
-            style.textContent = `
-                .adminDrawerLogo { content: url('') !important; }
-                .cardContent { min-height: 0; }
-            `;
-            document.head.appendChild(style);
-        };
-        if (document.readyState === 'loading') {
-            document.addEventListener('DOMContentLoaded', apply);
-        } else {
-            apply();
-        }
-    }
-
-    // ========================================
-    // Public API
-    // ========================================
-
-    function getDeviceId() {
-        let id = localStorage.getItem('embyAdapterDeviceId');
-        if (!id) {
-            id = 'ea_' + Math.random().toString(36).substring(2) + Date.now().toString(36);
-            localStorage.setItem('embyAdapterDeviceId', id);
-        }
-        return id;
-    }
+    // ==================== Public API ====================
 
     window.EmbyAdapter = {
         version: ADAPTER_VERSION,
 
-        configure(serverUrl, token) {
-            localStorage.setItem(CONFIG_KEY, JSON.stringify({ serverUrl, token }));
-
-            // Also write jellyfin_credentials so ConnectionManager finds the server
-            // CRITICAL: the address MUST be the Emby server, NOT the GitHub Pages origin
-            const creds = {
-                Servers: [{
-                    ManualAddress: serverUrl,
-                    LocalAddress: serverUrl,
-                    RemoteAddress: serverUrl,
-                    Id: '',  // Will be filled after first successful connection
-                    AccessToken: token,
-                    DateLastAccessed: new Date().toISOString(),
-                    LastConnectionMode: 2,
-                }],
-            };
-            localStorage.setItem(CREDS_KEY, JSON.stringify(creds));
-            log('Configured:', serverUrl);
+        setServerUrl: function(url) {
+            let normalized = url.trim().replace(/\/+$/, '');
+            if (!/^https?:\/\//i.test(normalized)) {
+                normalized = 'http://' + normalized;
+            }
+            embyServerUrl = normalized;
+            localStorage.setItem(EMBY_SERVER_KEY, embyServerUrl);
+            log('Server URL set:', embyServerUrl);
         },
 
-        getConfig,
-
-        setDebug(enabled) {
-            DEBUG = !!enabled;
-            localStorage.setItem('embyAdapterDebug', String(DEBUG));
+        getServerUrl: function() {
+            return embyServerUrl;
         },
 
-        async testConnection(serverUrl) {
+        setAccessToken: function(token) {
+            embyAccessToken = token;
+            localStorage.setItem(EMBY_TOKEN_KEY, token);
+        },
+
+        getAccessToken: function() {
+            return embyAccessToken;
+        },
+
+        getUserId: function() {
+            return embyUserId;
+        },
+
+        setEnabled: function(enabled) {
+            adapterEnabled = enabled;
+            log('Adapter', enabled ? 'enabled' : 'disabled');
+        },
+
+        isEnabled: function() {
+            return adapterEnabled;
+        },
+
+        clearCredentials: function() {
+            embyAccessToken = '';
+            embyUserId = '';
+            embyServerUrl = '';
+            localStorage.removeItem(EMBY_TOKEN_KEY);
+            localStorage.removeItem(EMBY_USER_KEY);
+            localStorage.removeItem(EMBY_SERVER_KEY);
+            localStorage.removeItem('jellyfin_credentials');
+            localStorage.removeItem('emby_server_name');
+            localStorage.removeItem('emby_server_id');
+        },
+
+        testConnection: async function(serverUrl) {
+            let baseUrl = serverUrl || embyServerUrl;
+            baseUrl = baseUrl.trim().replace(/\/+$/, '');
+            if (!/^https?:\/\//i.test(baseUrl)) {
+                baseUrl = 'http://' + baseUrl;
+            }
+
+            const url = baseUrl + '/emby/System/Info/Public';
             try {
-                const url = serverUrl.replace(/\/+$/, '') + '/emby/System/Info/Public';
-                const resp = await originalFetch(url);
-                if (!resp.ok) return { success: false, error: `HTTP ${resp.status}` };
+                const resp = await originalFetch(url, {
+                    method: 'GET',
+                    headers: { 'Content-Type': 'application/json' }
+                });
+                if (!resp.ok) return { success: false, error: 'HTTP ' + resp.status };
                 const data = await resp.json();
-                return { success: true, serverName: data.ServerName, version: data.Version };
+                return {
+                    success: true,
+                    serverName: data.ServerName,
+                    version: data.Version,
+                    id: data.Id
+                };
             } catch (e) {
                 return { success: false, error: e.message };
             }
         },
 
-        async authenticate(serverUrl, username, password) {
-            const url = serverUrl.replace(/\/+$/, '') + '/emby/Users/AuthenticateByName';
-            const resp = await originalFetch(url, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'Authorization': `Emby Client="Jellyfin Web", Device="Browser", DeviceId="${getDeviceId()}", Version="${ADAPTER_VERSION}"`,
-                },
-                body: JSON.stringify({ Username: username, Pw: password }),
-            });
-            if (!resp.ok) {
-                const text = await resp.text().catch(() => '');
-                throw new Error(`Auth failed: ${resp.status} ${text}`);
+        authenticate: async function(serverUrl, username, password) {
+            let baseUrl = (serverUrl || embyServerUrl).trim().replace(/\/+$/, '');
+            if (!/^https?:\/\//i.test(baseUrl)) {
+                baseUrl = 'http://' + baseUrl;
             }
-            const data = await resp.json();
-            const token = data.AccessToken;
 
-            // Configure adapter + write credentials
-            this.configure(serverUrl, token);
+            const url = baseUrl + '/emby/Users/AuthenticateByName';
+            const authValue = buildEmbyAuthHeaderValue(null);
 
-            // Update credentials with server ID and user info
             try {
-                const serverId = data.ServerId || data.SessionInfo?.ServerId || '';
-                const userId = data.User?.Id || '';
-                const creds = {
-                    Servers: [{
-                        ManualAddress: serverUrl,
-                        LocalAddress: serverUrl,
-                        RemoteAddress: serverUrl,
-                        Id: serverId,
-                        UserId: userId,
-                        AccessToken: token,
-                        Name: data.SessionInfo?.ServerName || data.ServerName || 'Emby Server',
-                        DateLastAccessed: new Date().toISOString(),
-                        LastConnectionMode: 2,
-                    }],
+                const resp = await originalFetch(url, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': authValue
+                    },
+                    body: JSON.stringify({
+                        Username: username,
+                        Pw: password
+                    })
+                });
+
+                if (!resp.ok) {
+                    const errorText = await resp.text();
+                    return { success: false, error: 'Authentication failed: HTTP ' + resp.status, details: errorText };
+                }
+
+                const data = await resp.json();
+
+                // Store credentials
+                embyAccessToken = data.AccessToken;
+                embyUserId = data.User.Id;
+                embyServerUrl = baseUrl;
+                localStorage.setItem(EMBY_TOKEN_KEY, embyAccessToken);
+                localStorage.setItem(EMBY_USER_KEY, embyUserId);
+                localStorage.setItem(EMBY_SERVER_KEY, embyServerUrl);
+
+                return {
+                    success: true,
+                    accessToken: data.AccessToken,
+                    userId: data.User.Id,
+                    userName: data.User.Name,
+                    serverId: data.ServerId
                 };
-                localStorage.setItem(CREDS_KEY, JSON.stringify(creds));
-            } catch (e) { warn('Credential sync error:', e); }
-
-            return data;
-        },
-
-        logout() {
-            localStorage.removeItem(CONFIG_KEY);
-            localStorage.removeItem(CREDS_KEY);
-            window.location.reload();
-        },
+            } catch (e) {
+                return { success: false, error: e.message };
+            }
+        }
     };
 
-    // ========================================
-    // Init
-    // ========================================
+    // ==================== Initialization ====================
 
-    applyUIPatches();
-    log('Server:', getServerUrl() || '(not configured)');
-    log('Initialized.');
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', setupImageObserver);
+    } else {
+        setupImageObserver();
+    }
+
+    log('Emby Adapter v' + ADAPTER_VERSION + ' initialized');
+    if (embyServerUrl) {
+        log('Server:', embyServerUrl);
+        log('Token:', embyAccessToken ? 'present' : 'none');
+    }
 
 })();
