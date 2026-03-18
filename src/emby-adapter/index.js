@@ -1,9 +1,14 @@
 /**
- * Emby Adapter - Entry Point v1.2.0
+ * Emby Adapter - Entry Point v1.3.0
  * 
  * Based on the stable ce25248 version.
  * Shows setup UI when no server is configured,
  * syncs credentials to Jellyfin format when configured.
+ * 
+ * v1.3.0 additions:
+ * - Service Worker registration for CORS proxy (video/audio direct play)
+ * - crossorigin="anonymous" attribute injection for media elements (Firefox fix)
+ * - postMessage to SW with Emby server origin
  */
 
 // Load the core adapter first
@@ -15,10 +20,142 @@ import './embyAdapter.js';
     const EMBY_SERVER_KEY = 'emby_server_url';
     const EMBY_TOKEN_KEY = 'emby_access_token';
 
-    /**
-     * Inject Jellyfin credentials format so Jellyfin Web recognizes the login.
-     * CRITICAL: ManualAddress must be the REAL Emby server URL, not GitHub Pages.
-     */
+    // ==================== Service Worker Registration ====================
+
+    function sendEmbyOriginToSW() {
+        const serverUrl = localStorage.getItem(EMBY_SERVER_KEY);
+        if (!serverUrl || !navigator.serviceWorker || !navigator.serviceWorker.controller) return;
+
+        try {
+            const origin = new URL(serverUrl).origin;
+            navigator.serviceWorker.controller.postMessage({
+                type: 'SET_EMBY_SERVER',
+                origin: origin
+            });
+            console.log('[EmbyAdapter] Sent Emby server origin to SW:', origin);
+        } catch (e) {
+            console.warn('[EmbyAdapter] Failed to send origin to SW:', e);
+        }
+    }
+
+    async function registerServiceWorker() {
+        if (!('serviceWorker' in navigator)) {
+            console.warn('[EmbyAdapter] Service Workers not supported in this browser');
+            return;
+        }
+
+        try {
+            const basePath = document.baseURI
+                ? new URL(document.baseURI).pathname.replace(/\/[^/]*$/, '/')
+                : '/';
+            const swPath = basePath + 'sw.js';
+
+            const registration = await navigator.serviceWorker.register(swPath, {
+                scope: basePath
+            });
+
+            console.log('[EmbyAdapter] Service Worker registered, scope:', registration.scope);
+
+            if (registration.waiting) {
+                registration.waiting.postMessage({ type: 'SKIP_WAITING' });
+            }
+
+            registration.addEventListener('updatefound', () => {
+                const newWorker = registration.installing;
+                if (newWorker) {
+                    newWorker.addEventListener('statechange', () => {
+                        if (newWorker.state === 'activated') {
+                            sendEmbyOriginToSW();
+                        }
+                    });
+                }
+            });
+
+            navigator.serviceWorker.ready.then(() => {
+                sendEmbyOriginToSW();
+            });
+
+            navigator.serviceWorker.addEventListener('controllerchange', () => {
+                console.log('[EmbyAdapter] New Service Worker controller, re-sending origin');
+                sendEmbyOriginToSW();
+            });
+
+        } catch (error) {
+            console.error('[EmbyAdapter] Service Worker registration failed:', error);
+        }
+    }
+
+    // Register SW immediately
+    registerServiceWorker();
+
+    // ==================== crossorigin Attribute Injection ====================
+
+    const _originalCreateElement = document.createElement.bind(document);
+
+    document.createElement = function(tagName, options) {
+        const element = _originalCreateElement(tagName, options);
+
+        if (typeof tagName === 'string') {
+            const tag = tagName.toLowerCase();
+            if (tag === 'video' || tag === 'audio') {
+                element.setAttribute('crossorigin', 'anonymous');
+            }
+        }
+
+        return element;
+    };
+
+    function setupMediaElementObserver() {
+        const addCrossOrigin = (element) => {
+            if (element.nodeType !== Node.ELEMENT_NODE) return;
+            const tag = element.tagName;
+            if (tag === 'VIDEO' || tag === 'AUDIO') {
+                if (!element.hasAttribute('crossorigin')) {
+                    element.setAttribute('crossorigin', 'anonymous');
+                }
+            }
+            const mediaChildren = element.querySelectorAll
+                ? element.querySelectorAll('video, audio')
+                : [];
+            mediaChildren.forEach((child) => {
+                if (!child.hasAttribute('crossorigin')) {
+                    child.setAttribute('crossorigin', 'anonymous');
+                }
+            });
+        };
+
+        const observer = new MutationObserver((mutations) => {
+            for (const mutation of mutations) {
+                for (const node of mutation.addedNodes) {
+                    addCrossOrigin(node);
+                }
+                if (mutation.type === 'attributes' &&
+                    mutation.attributeName === 'src' &&
+                    mutation.target &&
+                    (mutation.target.tagName === 'VIDEO' || mutation.target.tagName === 'AUDIO')) {
+                    if (!mutation.target.hasAttribute('crossorigin')) {
+                        mutation.target.setAttribute('crossorigin', 'anonymous');
+                    }
+                }
+            }
+        });
+
+        observer.observe(document.documentElement, {
+            childList: true,
+            subtree: true,
+            attributes: true,
+            attributeFilter: ['src']
+        });
+    }
+
+    if (document.documentElement) {
+        setupMediaElementObserver();
+    } else {
+        document.addEventListener('DOMContentLoaded', setupMediaElementObserver);
+    }
+
+    // ==================== Credential Sync ====================
+
     function syncCredentialsToJellyfin() {
         const serverUrl = localStorage.getItem(EMBY_SERVER_KEY);
         const token = localStorage.getItem(EMBY_TOKEN_KEY);
@@ -44,9 +181,6 @@ import './embyAdapter.js';
         console.log('[EmbyAdapter] Credentials synced to Jellyfin format');
     }
 
-    /**
-     * Normalize a server URL input
-     */
     function normalizeServerUrl(input) {
         let url = input.trim().replace(/\/+$/, '');
         if (!/^https?:\/\//i.test(url)) {
@@ -55,9 +189,6 @@ import './embyAdapter.js';
         return url;
     }
 
-    /**
-     * Show the Emby server setup page
-     */
     function showSetupPage() {
         const show = () => {
             document.body.innerHTML = '';
@@ -100,7 +231,7 @@ import './embyAdapter.js';
                 </div>
                 <div style="margin-top:24px;padding-top:16px;border-top:1px solid #333;text-align:center;">
                     <p style="margin:0;color:#555;font-size:12px;">
-                        Powered by <a href="https://github.com/Tsutomu-miku/jellyfin-web-emby" target="_blank" style="color:#00a4dc;text-decoration:none;">jellyfin-web-emby</a>
+                        Powered by <a href="https://github.com/tsutomu-miku/jellyfin-web-emby" target="_blank" style="color:#00a4dc;text-decoration:none;">jellyfin-web-emby</a>
                     </p>
                 </div>
             `;
@@ -126,9 +257,6 @@ import './embyAdapter.js';
         }
     }
 
-    /**
-     * Handle the connect button click
-     */
     async function handleConnect() {
         const rawServerUrl = document.getElementById('emby-server-url').value.trim();
         const username = document.getElementById('emby-username').value.trim();
@@ -152,7 +280,6 @@ import './embyAdapter.js';
         btn.style.opacity = '0.7';
         statusEl.innerHTML = '<span style="color:#aaa;">Testing connection to ' + serverUrl + '...</span>';
 
-        // Step 1: Test connection
         const testResult = await window.EmbyAdapter.testConnection(serverUrl);
         if (!testResult.success) {
             statusEl.innerHTML = '<span style="color:#e74c3c;">Connection failed: ' + testResult.error + '</span>';
@@ -167,7 +294,6 @@ import './embyAdapter.js';
         localStorage.setItem('emby_server_name', testResult.serverName || '');
         localStorage.setItem('emby_server_id', testResult.id || '');
 
-        // Step 2: Authenticate
         const authResult = await window.EmbyAdapter.authenticate(serverUrl, username, password);
         if (!authResult.success) {
             statusEl.innerHTML = '<span style="color:#e74c3c;">' + authResult.error + '</span>';
@@ -179,8 +305,8 @@ import './embyAdapter.js';
 
         statusEl.innerHTML = '<span style="color:#2ecc71;">Authenticated as ' + authResult.userName + '. Loading...</span>';
 
-        // Step 3: Sync credentials and reload
         syncCredentialsToJellyfin();
+        sendEmbyOriginToSW();
 
         setTimeout(() => {
             window.location.reload();
@@ -194,6 +320,7 @@ import './embyAdapter.js';
 
     if (serverUrl && token) {
         syncCredentialsToJellyfin();
+        sendEmbyOriginToSW();
         console.log('[EmbyAdapter] Emby server configured, Jellyfin Web will load normally with adapter active');
     } else {
         showSetupPage();
