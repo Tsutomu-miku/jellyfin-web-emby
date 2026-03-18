@@ -1,16 +1,14 @@
 /**
- * Emby API Adapter for Jellyfin Web v1.2.0
+ * Emby API Adapter for Jellyfin Web v1.3.0
  * 
- * Based on the stable ce25248 version, with two targeted fixes:
+ * Based on the stable ce25248 version, with targeted fixes:
  * 1. config.json interception: tells ConnectionManager the real Emby server URL
- *    (prevents it from using GitHub Pages origin as the server)
  * 2. Version spoofing: replaces Emby 4.x version with 10.10.7
- *    (prevents "server needs to be updated" error)
+ * 3. Auto-detect /emby/ prefix: some Emby servers need it, some don't
  * 
  * Key differences handled:
- * 1. URL prefix: Emby requires /emby/ prefix on API paths
+ * 1. URL prefix: Some Emby servers require /emby/ prefix, auto-detected
  * 2. Auth header: Uses "Emby" scheme in standard Authorization header
- *    (avoids X-Emby-Authorization to prevent CORS preflight issues)
  * 3. Token passing: Embedded in Authorization header value
  */
 
@@ -19,11 +17,12 @@
 
     // ==================== Configuration ====================
 
-    const ADAPTER_VERSION = '1.2.0';
+    const ADAPTER_VERSION = '1.3.0';
     const STORAGE_KEY = 'emby_adapter_config';
     const EMBY_TOKEN_KEY = 'emby_access_token';
     const EMBY_USER_KEY = 'emby_user_id';
     const EMBY_SERVER_KEY = 'emby_server_url';
+    const EMBY_PREFIX_KEY = 'emby_needs_prefix';
     const SPOOFED_VERSION = '10.10.7';
 
     // Paths that should NOT get the /emby/ prefix (static resources)
@@ -39,6 +38,13 @@
     let embyAccessToken = localStorage.getItem(EMBY_TOKEN_KEY) || '';
     let embyUserId = localStorage.getItem(EMBY_USER_KEY) || '';
     let adapterEnabled = true;
+    // Whether the server needs /emby/ prefix. null = not yet detected.
+    let needsEmbyPrefix = (() => {
+        const stored = localStorage.getItem(EMBY_PREFIX_KEY);
+        if (stored === 'true') return true;
+        if (stored === 'false') return false;
+        return null;
+    })();
 
     // ==================== Helpers ====================
 
@@ -54,8 +60,6 @@
 
     /**
      * Check if a URL is a same-origin config.json request.
-     * We intercept this to inject the Emby server address so that
-     * ConnectionManager connects to the real server, not GitHub Pages.
      */
     function isConfigJsonRequest(url) {
         try {
@@ -77,9 +81,12 @@
             const parsed = new URL(url, window.location.origin);
             const serverParsed = new URL(embyServerUrl);
 
-            // Must be same origin as Emby server (includes port check)
+            // Must match Emby server hostname
             if (parsed.hostname !== serverParsed.hostname) return false;
-            if ((parsed.port || '') !== (serverParsed.port || '')) return false;
+            // Port check: for https default 443, for http default 80
+            const parsedPort = parsed.port || (parsed.protocol === 'https:' ? '443' : '80');
+            const serverPort = serverParsed.port || (serverParsed.protocol === 'https:' ? '443' : '80');
+            if (parsedPort !== serverPort) return false;
 
             // Static resources don't need adaptation
             const pathname = parsed.pathname.toLowerCase();
@@ -87,7 +94,6 @@
                 if (pathname.endsWith(ext)) return false;
             }
 
-            // Already has /emby/ prefix - still an Emby API request, just don't double-add
             return true;
         } catch (e) {
             return false;
@@ -96,7 +102,6 @@
 
     /**
      * Check if response needs version spoofing.
-     * Applies to /System/Info/Public and /System/Info endpoints.
      */
     function needsVersionSpoof(url) {
         try {
@@ -112,7 +117,6 @@
 
     /**
      * Replace version in JSON response body.
-     * Emby reports 4.x which fails Jellyfin's >= 10.9.0 check.
      */
     function spoofVersionInJson(bodyText) {
         try {
@@ -120,7 +124,6 @@
             if (data && typeof data.Version === 'string') {
                 log('Spoofing version:', data.Version, '->', SPOOFED_VERSION);
                 data.Version = SPOOFED_VERSION;
-                // Also ensure ProductName looks like Jellyfin
                 if (!data.ProductName || data.ProductName.toLowerCase().includes('emby')) {
                     data.ProductName = 'Jellyfin Server';
                 }
@@ -133,9 +136,13 @@
     }
 
     /**
-     * Add /emby/ prefix to API path
+     * Conditionally add /emby/ prefix based on auto-detection result.
+     * If needsEmbyPrefix is false or null, don't add it.
+     * If the URL already has /emby/ prefix, leave it alone.
      */
-    function addEmbyPrefix(url) {
+    function maybeAddEmbyPrefix(url) {
+        if (!needsEmbyPrefix) return url; // false or null => don't add
+
         try {
             const parsed = new URL(url);
             if (!parsed.pathname.toLowerCase().startsWith('/emby/') &&
@@ -144,7 +151,6 @@
             }
             return parsed.toString();
         } catch (e) {
-            // Relative URL
             if (!url.startsWith('/emby/')) {
                 return '/emby' + (url.startsWith('/') ? url : '/' + url);
             }
@@ -154,8 +160,6 @@
 
     /**
      * Build the Emby auth header value.
-     * Uses the standard "Authorization" header ONLY (not X-Emby-Authorization)
-     * to avoid CORS preflight issues.
      */
     function buildEmbyAuthHeaderValue(token) {
         const deviceId = localStorage.getItem('emby_device_id') ||
@@ -178,7 +182,6 @@
 
     /**
      * Transform Jellyfin auth header to Emby format.
-     * Replaces MediaBrowser/Jellyfin prefix with Emby.
      */
     function transformAuthHeader(value) {
         if (!value) return value;
@@ -190,7 +193,6 @@
             transformed = 'Emby ' + transformed.substring('Jellyfin '.length);
         }
 
-        // If we have a token and it's not in the header, add it
         if (embyAccessToken && !transformed.includes('Token=')) {
             transformed += ', Token="' + embyAccessToken + '"';
         }
@@ -200,13 +202,11 @@
 
     /**
      * Transform request headers for Emby compatibility.
-     * CORS strategy: ONLY use standard headers (Authorization, Content-Type).
      */
     function transformHeaders(headers) {
         const newHeaders = new Headers();
         let authValue = null;
 
-        // Handle various header input types
         const entries = [];
         if (headers instanceof Headers) {
             headers.forEach((value, key) => entries.push([key, value]));
@@ -219,20 +219,17 @@
         for (const [key, value] of entries) {
             const lowerKey = key.toLowerCase();
 
-            // Skip any X-Emby-* / X-MediaBrowser-* custom headers for CORS safety
             if (lowerKey.startsWith('x-emby-') || lowerKey.startsWith('x-mediabrowser-')) {
-                // Extract token if present in custom header
                 if ((lowerKey === 'x-emby-token' || lowerKey === 'x-mediabrowser-token') && value) {
                     if (!embyAccessToken) {
                         embyAccessToken = value;
                         localStorage.setItem(EMBY_TOKEN_KEY, value);
                     }
                 }
-                // If X-Emby-Authorization, use it as the base for our Authorization header
                 if (lowerKey === 'x-emby-authorization') {
                     authValue = transformAuthHeader(value);
                 }
-                continue; // Don't copy this header
+                continue;
             }
 
             if (lowerKey === 'authorization') {
@@ -242,7 +239,6 @@
             }
         }
 
-        // Set the Authorization header
         if (authValue) {
             newHeaders.set('Authorization', authValue);
         } else if (embyAccessToken) {
@@ -282,8 +278,6 @@
 
     /**
      * Generate a synthetic config.json response.
-     * This tells ConnectionManager where the Emby server is,
-     * preventing it from falling back to window.location.origin (GitHub Pages).
      */
     function createConfigJsonResponse() {
         const config = {};
@@ -353,8 +347,8 @@
 
         log('Intercepting fetch:', url);
 
-        // Transform URL: add /emby/ prefix
-        const newUrl = addEmbyPrefix(url);
+        // Conditionally add /emby/ prefix (only if server needs it)
+        const newUrl = maybeAddEmbyPrefix(url);
 
         // Transform headers
         const newHeaders = transformHeaders(options.headers);
@@ -367,10 +361,9 @@
         log('Adapted to:', newUrl);
 
         return originalFetch.call(this, newUrl, newOptions).then(response => {
-            // Handle auth responses
             handleAuthResponse(url, response);
 
-            // Version spoofing for System/Info endpoints
+            // Version spoofing
             if (needsVersionSpoof(newUrl) && response.ok) {
                 return response.clone().text().then(bodyText => {
                     const spoofed = spoofVersionInJson(bodyText);
@@ -401,15 +394,13 @@
 
         let adaptedUrl = url;
 
-        // Check config.json first
         if (adapterEnabled && isConfigJsonRequest(String(url))) {
             this._embyIsConfigJson = true;
-            // Don't actually open the request, we'll fake it in send()
             return XHROpen.call(this, method, adaptedUrl, async !== false, user, password);
         }
 
         if (adapterEnabled && isEmbyApiRequest(String(url))) {
-            adaptedUrl = addEmbyPrefix(String(url));
+            adaptedUrl = maybeAddEmbyPrefix(String(url));
             this._embyAdapted = true;
             log('XHR Intercepting:', url, '->', adaptedUrl);
         }
@@ -421,7 +412,6 @@
         if (this._embyAdapted) {
             const lowerName = name.toLowerCase();
 
-            // Skip custom Emby headers for CORS safety
             if (lowerName.startsWith('x-emby-') || lowerName.startsWith('x-mediabrowser-')) {
                 if ((lowerName === 'x-emby-token' || lowerName === 'x-mediabrowser-token') && value) {
                     if (!embyAccessToken) {
@@ -434,7 +424,7 @@
                     this._embyHeaders['Authorization'] = transformed;
                     return XHRSetHeader.call(this, 'Authorization', transformed);
                 }
-                return; // Don't send this header
+                return;
             }
 
             if (lowerName === 'authorization') {
@@ -448,7 +438,6 @@
     };
 
     XMLHttpRequest.prototype.send = function(body) {
-        // Handle config.json interception
         if (this._embyIsConfigJson) {
             const self = this;
             const configData = JSON.stringify({
@@ -458,7 +447,6 @@
             });
             log('XHR config.json intercepted');
             setTimeout(function() {
-                // Fake a successful response
                 Object.defineProperty(self, 'readyState', { value: 4, writable: false, configurable: true });
                 Object.defineProperty(self, 'status', { value: 200, writable: false, configurable: true });
                 Object.defineProperty(self, 'statusText', { value: 'OK', writable: false, configurable: true });
@@ -475,13 +463,11 @@
         }
 
         if (this._embyAdapted) {
-            // Add auth header if missing
             if (embyAccessToken && !this._embyHeaders['Authorization']) {
                 const authValue = buildEmbyAuthHeaderValue(embyAccessToken);
                 XHRSetHeader.call(this, 'Authorization', authValue);
             }
 
-            // Version spoofing for System/Info
             if (needsVersionSpoof(this._embyOriginalUrl)) {
                 this.addEventListener('readystatechange', function() {
                     if (this.readyState === 4 && this.status === 200) {
@@ -496,7 +482,6 @@
                 });
             }
 
-            // Listen for auth responses
             this.addEventListener('load', function() {
                 if (this._embyOriginalUrl && this._embyOriginalUrl.includes('/Users/AuthenticateByName')) {
                     try {
@@ -556,8 +541,9 @@
             const srcUrl = new URL(src, window.location.origin);
             const serverUrl = new URL(embyServerUrl);
 
-            if (srcUrl.origin === serverUrl.origin && !srcUrl.searchParams.has('api_key')) {
-                if (!srcUrl.pathname.startsWith('/emby/')) {
+            if (srcUrl.hostname === serverUrl.hostname && !srcUrl.searchParams.has('api_key')) {
+                // Only add /emby/ prefix if the server needs it
+                if (needsEmbyPrefix && !srcUrl.pathname.startsWith('/emby/')) {
                     srcUrl.pathname = '/emby' + srcUrl.pathname;
                 }
                 srcUrl.searchParams.set('api_key', embyAccessToken);
@@ -585,13 +571,11 @@
                 }
 
                 // If WebSocket is going to the Emby server
-                if (wsUrl.hostname === serverUrl.hostname &&
-                    (wsUrl.port || '') === (serverUrl.port || '')) {
-                    // Add /emby prefix if needed
-                    if (!wsUrl.pathname.startsWith('/emby')) {
+                if (wsUrl.hostname === serverUrl.hostname) {
+                    // Only add /emby prefix if server needs it
+                    if (needsEmbyPrefix && !wsUrl.pathname.startsWith('/emby')) {
                         wsUrl.pathname = '/emby' + wsUrl.pathname;
                     }
-                    // Add api_key parameter
                     if (embyAccessToken && !wsUrl.searchParams.has('api_key')) {
                         wsUrl.searchParams.set('api_key', embyAccessToken);
                     }
@@ -655,14 +639,20 @@
             embyAccessToken = '';
             embyUserId = '';
             embyServerUrl = '';
+            needsEmbyPrefix = null;
             localStorage.removeItem(EMBY_TOKEN_KEY);
             localStorage.removeItem(EMBY_USER_KEY);
             localStorage.removeItem(EMBY_SERVER_KEY);
+            localStorage.removeItem(EMBY_PREFIX_KEY);
             localStorage.removeItem('jellyfin_credentials');
             localStorage.removeItem('emby_server_name');
             localStorage.removeItem('emby_server_id');
         },
 
+        /**
+         * Test connection to Emby server.
+         * Also auto-detects whether the server needs /emby/ prefix.
+         */
         testConnection: async function(serverUrl) {
             let baseUrl = serverUrl || embyServerUrl;
             baseUrl = baseUrl.trim().replace(/\/+$/, '');
@@ -670,32 +660,68 @@
                 baseUrl = 'http://' + baseUrl;
             }
 
-            const url = baseUrl + '/emby/System/Info/Public';
+            // Try WITHOUT /emby/ prefix first (more common for newer Emby setups)
+            let url = baseUrl + '/System/Info/Public';
             try {
-                const resp = await originalFetch(url, {
+                let resp = await originalFetch(url, {
                     method: 'GET',
                     headers: { 'Content-Type': 'application/json' }
                 });
-                if (!resp.ok) return { success: false, error: 'HTTP ' + resp.status };
-                const data = await resp.json();
-                return {
-                    success: true,
-                    serverName: data.ServerName,
-                    version: data.Version,
-                    id: data.Id
-                };
+
+                if (resp.ok) {
+                    const data = await resp.json();
+                    needsEmbyPrefix = false;
+                    localStorage.setItem(EMBY_PREFIX_KEY, 'false');
+                    log('Server does NOT need /emby/ prefix');
+                    return {
+                        success: true,
+                        serverName: data.ServerName,
+                        version: data.Version,
+                        id: data.Id
+                    };
+                }
+            } catch (e) {
+                log('No-prefix test failed, trying with /emby/:', e.message);
+            }
+
+            // Try WITH /emby/ prefix (some setups require it)
+            url = baseUrl + '/emby/System/Info/Public';
+            try {
+                let resp = await originalFetch(url, {
+                    method: 'GET',
+                    headers: { 'Content-Type': 'application/json' }
+                });
+
+                if (resp.ok) {
+                    const data = await resp.json();
+                    needsEmbyPrefix = true;
+                    localStorage.setItem(EMBY_PREFIX_KEY, 'true');
+                    log('Server NEEDS /emby/ prefix');
+                    return {
+                        success: true,
+                        serverName: data.ServerName,
+                        version: data.Version,
+                        id: data.Id
+                    };
+                }
+                return { success: false, error: 'HTTP ' + resp.status };
             } catch (e) {
                 return { success: false, error: e.message };
             }
         },
 
+        /**
+         * Authenticate with Emby server.
+         * Uses the detected prefix setting.
+         */
         authenticate: async function(serverUrl, username, password) {
             let baseUrl = (serverUrl || embyServerUrl).trim().replace(/\/+$/, '');
             if (!/^https?:\/\//i.test(baseUrl)) {
                 baseUrl = 'http://' + baseUrl;
             }
 
-            const url = baseUrl + '/emby/Users/AuthenticateByName';
+            const prefix = needsEmbyPrefix ? '/emby' : '';
+            const url = baseUrl + prefix + '/Users/AuthenticateByName';
             const authValue = buildEmbyAuthHeaderValue(null);
 
             try {
@@ -718,7 +744,6 @@
 
                 const data = await resp.json();
 
-                // Store credentials
                 embyAccessToken = data.AccessToken;
                 embyUserId = data.User.Id;
                 embyServerUrl = baseUrl;
@@ -748,9 +773,8 @@
     }
 
     log('Emby Adapter v' + ADAPTER_VERSION + ' initialized');
-    if (embyServerUrl) {
-        log('Server:', embyServerUrl);
-        log('Token:', embyAccessToken ? 'present' : 'none');
-    }
+    log('Server:', embyServerUrl || '(not configured)');
+    log('Prefix mode:', needsEmbyPrefix === null ? 'auto-detect pending' : (needsEmbyPrefix ? '/emby/ required' : 'no prefix'));
+    if (embyAccessToken) log('Token: present');
 
 })();
