@@ -19,7 +19,7 @@
     // Configuration
     // ========================================
 
-    const ADAPTER_VERSION = '1.4.0';
+    const ADAPTER_VERSION = '1.5.0';
     let DEBUG = localStorage.getItem('embyAdapterDebug') === 'true';
 
     const SPOOFED_JELLYFIN_VERSION = '10.10.7';
@@ -31,8 +31,9 @@
     ];
 
     // Known Jellyfin/Emby API path prefixes (lowercase).
-    // If a request to the SAME origin matches one of these, it is actually
-    // an API call that should be routed to the configured Emby server.
+    // If a same-origin request matches one of these, it's an API call that
+    // ConnectionManager/SDK built with a relative URL — it should be routed
+    // to the configured Emby server instead of hitting GitHub Pages.
     const API_PATH_PATTERNS = [
         '/system/', '/users/', '/items', '/sessions',
         '/library/', '/branding/', '/displaypreferences',
@@ -42,7 +43,7 @@
         '/persons', '/years', '/channels', '/notifications',
         '/scheduledtasks', '/packages', '/plugins',
         '/environment/', '/localization/', '/search/',
-        '/images/', '/web/', '/shows/', '/movies/',
+        '/images/', '/shows/', '/movies/',
         '/trailers', '/similar', '/suggestions',
         '/playback/', '/sync/', '/devices/',
     ];
@@ -58,31 +59,60 @@
     log(`Emby Adapter v${ADAPTER_VERSION} initializing...`);
 
     // ========================================
-    // Server URL helper
+    // Server URL helper — checks MULTIPLE sources
     // ========================================
 
+    /**
+     * Get the Emby server URL from the best available source:
+     * 1. embyAdapterConfig (set by adapter's own login flow)
+     * 2. jellyfin_credentials (set by ConnectionManager after login)
+     * 
+     * This ensures we can route API requests even if one source is missing.
+     */
     function getEmbyServerUrl() {
+        // Source 1: adapter config
         try {
             const cfg = JSON.parse(localStorage.getItem('embyAdapterConfig') || '{}');
-            return cfg.serverUrl || '';
-        } catch { return ''; }
+            if (cfg.serverUrl) return cfg.serverUrl;
+        } catch { /* ignore */ }
+
+        // Source 2: jellyfin_credentials
+        try {
+            const creds = JSON.parse(localStorage.getItem('jellyfin_credentials') || '{}');
+            if (creds.Servers && creds.Servers.length > 0) {
+                const server = creds.Servers[0];
+                // Try multiple address fields that ConnectionManager might use
+                const addr = server.ManualAddress || server.LocalAddress || server.RemoteAddress;
+                if (addr) return addr;
+            }
+        } catch { /* ignore */ }
+
+        return '';
     }
 
     function getEmbyToken() {
+        // Source 1: adapter config
         try {
             const cfg = JSON.parse(localStorage.getItem('embyAdapterConfig') || '{}');
-            return cfg.token || '';
-        } catch { return ''; }
+            if (cfg.token) return cfg.token;
+        } catch { /* ignore */ }
+
+        // Source 2: jellyfin_credentials
+        try {
+            const creds = JSON.parse(localStorage.getItem('jellyfin_credentials') || '{}');
+            if (creds.Servers && creds.Servers.length > 0) {
+                const token = creds.Servers[0].AccessToken;
+                if (token) return token;
+            }
+        } catch { /* ignore */ }
+
+        return '';
     }
 
     // ========================================
     // Cross-origin detection
     // ========================================
 
-    /**
-     * Check if a URL is cross-origin (different host/port from current page).
-     * ALL cross-origin API requests need header cleanup for CORS safety.
-     */
     function isCrossOrigin(url) {
         if (!url) return false;
         try {
@@ -97,8 +127,6 @@
 
     /**
      * Check if a pathname looks like a Jellyfin/Emby API call.
-     * This is used to detect same-origin API requests that should be
-     * routed to the Emby server (e.g. "/System/Info/Public" on GitHub Pages).
      */
     function looksLikeApiPath(pathname) {
         const lp = pathname.toLowerCase();
@@ -112,24 +140,29 @@
     }
 
     /**
-     * Check whether a URL targets the configured Emby server (or should be routed there).
+     * Check whether a URL should be handled by the Emby adapter.
      * 
-     * Three detection methods:
+     * Detection methods:
      * 1. URL already points to the configured Emby server origin
      * 2. URL is cross-origin and path looks like an API call
-     * 3. URL is SAME-origin but path looks like an API call → this means
-     *    ConnectionManager used a relative path that resolved to GitHub Pages
+     * 3. URL is same-origin and path looks like an API call
+     *    (ConnectionManager used a relative path → resolved to GitHub Pages)
+     * 
+     * For method 3: even if no server is configured yet, we STILL detect it
+     * as an API call so we can block it (instead of letting it 404 on GitHub Pages).
      */
     function isEmbyApiUrl(url) {
         if (!url) return false;
         try {
             const u = new URL(url, window.location.origin);
-            const serverUrl = getEmbyServerUrl();
 
             // Method 1: match configured server origin
+            const serverUrl = getEmbyServerUrl();
             if (serverUrl) {
-                const s = new URL(serverUrl);
-                if (u.hostname === s.hostname && u.port === s.port) return true;
+                try {
+                    const s = new URL(serverUrl);
+                    if (u.hostname === s.hostname && u.port === s.port) return true;
+                } catch { /* ignore */ }
             }
 
             // Method 2: cross-origin request with API-like path
@@ -138,10 +171,10 @@
             }
 
             // Method 3: same-origin request with API-like path
-            // This catches the critical case where ConnectionManager builds
-            // relative URLs like "/System/Info/Public" which resolve to the
-            // GitHub Pages origin instead of the Emby server.
-            if (serverUrl && !isCrossOrigin(url) && looksLikeApiPath(u.pathname)) {
+            // This catches relative URLs that resolved to the GitHub Pages origin.
+            // We detect this even WITHOUT a configured server — we'll either redirect
+            // (if server is known) or return a synthetic error (if not).
+            if (!isCrossOrigin(url) && looksLikeApiPath(u.pathname)) {
                 return true;
             }
         } catch { /* ignore */ }
@@ -155,18 +188,20 @@
     /**
      * Rewrite a URL to point at the configured Emby server with /emby/ prefix.
      * 
-     * Handles two cases:
-     * 1. Same-origin relative API path → redirect to Emby server
-     * 2. Already cross-origin (Emby server) → just ensure /emby/ prefix
+     * Returns null if the URL needs rewriting but no server is configured
+     * (caller should handle this by returning a synthetic error).
      */
     function rewriteUrlForEmby(url) {
         try {
             const u = new URL(url, window.location.origin);
             const serverUrl = getEmbyServerUrl();
 
-            // If URL is same-origin (GitHub Pages) but looks like an API path,
-            // we need to redirect it to the Emby server
-            if (serverUrl && u.origin === window.location.origin) {
+            // If URL is same-origin, we MUST redirect it to the Emby server
+            if (u.origin === window.location.origin) {
+                if (!serverUrl) {
+                    // No server configured — can't redirect
+                    return null;
+                }
                 const server = new URL(serverUrl);
                 u.protocol = server.protocol;
                 u.hostname = server.hostname;
@@ -183,7 +218,6 @@
         } catch { return url; }
     }
 
-    // Keep backward compat (used in some places)
     function ensureEmbyPrefix(url) {
         return rewriteUrlForEmby(url);
     }
@@ -192,11 +226,6 @@
     // Version Spoofing
     // ========================================
 
-    /**
-     * Determine if a response from this URL needs its Version field spoofed.
-     * Uses CASE-INSENSITIVE matching because jellyfin-apiclient sends
-     * lowercase paths like "system/info/public".
-     */
     function needsVersionSpoof(url) {
         if (!url) return false;
         try {
@@ -219,9 +248,6 @@
         return false;
     }
 
-    /**
-     * Spoof the Version field in a system-info JSON response body.
-     */
     function spoofVersionInBody(bodyText) {
         try {
             const data = JSON.parse(bodyText);
@@ -244,9 +270,6 @@
     // Auth Header Helpers
     // ========================================
 
-    /**
-     * Build a proper Emby authorization header value.
-     */
     function buildEmbyAuthHeaderValue(originalValue) {
         if (!originalValue) return originalValue;
 
@@ -265,19 +288,11 @@
         return value;
     }
 
-    /**
-     * Check if a header name is a non-standard Emby/Jellyfin header that
-     * would trigger CORS preflight failures.
-     */
     function isProblematicHeader(name) {
         const lk = name.toLowerCase();
         return lk.startsWith('x-emby-') || lk.startsWith('x-mediabrowser-');
     }
 
-    /**
-     * Transform headers for CORS safety.
-     * Strips X-Emby-*, X-MediaBrowser-* and converts auth to standard Authorization.
-     */
     function transformHeaders(headers) {
         if (!headers) return headers;
 
@@ -289,7 +304,7 @@
                     if (lk === 'x-emby-authorization' || lk === 'x-mediabrowser-token') {
                         h.set('Authorization', buildEmbyAuthHeaderValue(value));
                     }
-                    continue; // drop it
+                    continue;
                 }
                 if (lk === 'authorization') {
                     h.set('Authorization', buildEmbyAuthHeaderValue(value));
@@ -414,6 +429,42 @@
     }
 
     // ========================================
+    // Synthetic Responses
+    // ========================================
+
+    /**
+     * Create a synthetic System/Info/Public response when no server is configured.
+     * This prevents 404 errors and lets ConnectionManager proceed.
+     */
+    function createSyntheticSystemInfoResponse() {
+        const data = {
+            LocalAddress: '',
+            ServerName: 'Emby Server (Not Configured)',
+            Version: SPOOFED_JELLYFIN_VERSION,
+            ProductName: 'Jellyfin Server',
+            Id: '00000000000000000000000000000000',
+            StartupWizardCompleted: true,
+        };
+        return new Response(JSON.stringify(data), {
+            status: 200,
+            statusText: 'OK',
+            headers: { 'Content-Type': 'application/json' },
+        });
+    }
+
+    /**
+     * Create a synthetic error response for API calls that can't be routed.
+     */
+    function createSyntheticErrorResponse(url) {
+        warn('No Emby server configured, blocking API call:', url);
+        return new Response(JSON.stringify({ error: 'No Emby server configured' }), {
+            status: 503,
+            statusText: 'Service Unavailable',
+            headers: { 'Content-Type': 'application/json' },
+        });
+    }
+
+    // ========================================
     // Fetch Interceptor
     // ========================================
 
@@ -427,12 +478,11 @@
             const crossOrigin = isCrossOrigin(url);
             const embyApi = isEmbyApiUrl(url);
 
-            // For ANY cross-origin request OR Emby API request, clean up problematic headers
+            // For ANY cross-origin or Emby API request, clean up problematic headers
             if (crossOrigin || embyApi) {
                 if (modifiedInit.headers) {
                     modifiedInit.headers = transformHeaders(modifiedInit.headers);
                 }
-                // If input is a Request object, we need to rebuild it with clean headers
                 if (input instanceof Request) {
                     const cleanHeaders = transformHeaders(new Headers(input.headers));
                     if (!modifiedInit.headers) {
@@ -441,9 +491,23 @@
                 }
             }
 
-            // For Emby API requests, rewrite URL to point at Emby server + /emby/ prefix
+            // For Emby API requests, rewrite URL to point at Emby server
             if (embyApi) {
                 const newUrl = rewriteUrlForEmby(url);
+
+                // If rewrite returned null, no server is configured
+                if (newUrl === null) {
+                    // For System/Info requests, return synthetic response
+                    // so ConnectionManager doesn't error out completely
+                    const lowerPath = new URL(url, window.location.origin).pathname.toLowerCase();
+                    if (lowerPath.includes('/system/info')) {
+                        log('No server configured, returning synthetic SystemInfo for:', url);
+                        return createSyntheticSystemInfoResponse();
+                    }
+                    // For other API calls, return 503
+                    return createSyntheticErrorResponse(url);
+                }
+
                 log('Fetch intercepted:', url, '->', newUrl);
                 url = newUrl;
 
@@ -537,24 +601,29 @@
         this._isEmbyApi = isEmbyApiUrl(url);
 
         if (this._isEmbyApi) {
-            url = rewriteUrlForEmby(url);
-            this._isCrossOrigin = true; // After rewrite, it's definitely cross-origin
-            log('XHR intercepted:', method, url);
+            const newUrl = rewriteUrlForEmby(url);
+            if (newUrl !== null) {
+                url = newUrl;
+                this._isCrossOrigin = true; // After rewrite, definitely cross-origin
+                log('XHR intercepted:', method, url);
+            } else {
+                // No server configured — mark for synthetic response in send()
+                this._noServerConfigured = true;
+                log('XHR: no server configured for:', method, url);
+            }
         }
         return originalXHROpen.call(this, method, url, ...rest);
     };
 
     XMLHttpRequest.prototype.setRequestHeader = function (name, value) {
-        // For ALL cross-origin or Emby API requests, strip problematic headers
         if (this._isCrossOrigin || this._isEmbyApi) {
             const lk = name.toLowerCase();
             if (isProblematicHeader(name)) {
                 if (lk === 'x-emby-authorization') {
-                    // Fold into standard Authorization header
                     return originalXHRSetHeader.call(this, 'Authorization', buildEmbyAuthHeaderValue(value));
                 }
                 log('Stripped header:', name);
-                return; // drop the header entirely
+                return;
             }
             if (lk === 'authorization') {
                 return originalXHRSetHeader.call(this, 'Authorization', buildEmbyAuthHeaderValue(value));
@@ -589,11 +658,9 @@
     window.WebSocket = function (url, protocols) {
         if (url) {
             log('WebSocket:', url);
-            // Rewrite WebSocket URL to point at Emby server if needed
             try {
                 const serverUrl = getEmbyServerUrl();
                 if (serverUrl && !isCrossOrigin(url)) {
-                    // Same-origin WebSocket → redirect to Emby server
                     const u = new URL(url, window.location.origin);
                     const s = new URL(serverUrl);
                     u.protocol = s.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -709,11 +776,14 @@
             const creds = {
                 Servers: [{
                     ManualAddress: serverUrl,
+                    LocalAddress: serverUrl,
+                    RemoteAddress: serverUrl,
                     Id: serverId,
                     UserId: userId,
                     AccessToken: token,
                     Name: authData.SessionInfo?.ServerName || 'Emby Server',
                     DateLastAccessed: new Date().toISOString(),
+                    LastConnectionMode: 2, // Manual
                 }],
             };
 
@@ -729,6 +799,15 @@
     // ========================================
 
     applyUIPatches();
+
+    // Log current config state for debugging
+    const serverUrl = getEmbyServerUrl();
+    if (serverUrl) {
+        log('Server URL found:', serverUrl);
+    } else {
+        log('No server URL configured yet — same-origin API calls will be intercepted with synthetic responses');
+    }
+
     log('Emby Adapter initialized successfully.');
 
 })();
