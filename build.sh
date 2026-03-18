@@ -1,7 +1,10 @@
 #!/bin/bash
 set -e
 
-JELLYFIN_WEB_VERSION=${JELLYFIN_WEB_VERSION:-"10.10.7"}
+# Strip leading 'v' if present (handle both '10.10.7' and 'v10.10.7')
+RAW_VERSION=${JELLYFIN_WEB_VERSION:-"10.10.7"}
+JELLYFIN_WEB_VERSION="${RAW_VERSION#v}"
+
 JELLYFIN_WEB_RELEASE_URL="https://github.com/jellyfin/jellyfin-web/archive/refs/tags/v${JELLYFIN_WEB_VERSION}.tar.gz"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -14,6 +17,7 @@ echo " Jellyfin Web Emby Adapter Build Script"
 echo "============================================"
 echo ""
 echo "Jellyfin Web Version: ${JELLYFIN_WEB_VERSION}"
+echo "Download URL: ${JELLYFIN_WEB_RELEASE_URL}"
 echo "Build Directory: ${BUILD_DIR}"
 echo "Distribution Directory: ${DIST_DIR}"
 echo ""

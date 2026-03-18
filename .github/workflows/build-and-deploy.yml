@@ -6,9 +6,9 @@ on:
   workflow_dispatch:
     inputs:
       jellyfin_web_version:
-        description: 'Jellyfin Web version/tag to build from'
+        description: 'Jellyfin Web version (without v prefix, e.g. 10.10.7)'
         required: false
-        default: 'v10.10.7'
+        default: '10.10.7'
         type: string
 
 # Sets permissions of the GITHUB_TOKEN to allow deployment to GitHub Pages
@@ -26,7 +26,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     env:
-      JELLYFIN_WEB_VERSION: ${{ github.event.inputs.jellyfin_web_version || 'v10.10.7' }}
+      JELLYFIN_WEB_VERSION: ${{ github.event.inputs.jellyfin_web_version || '10.10.7' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
