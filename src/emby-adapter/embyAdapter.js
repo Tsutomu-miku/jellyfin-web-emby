@@ -1,5 +1,5 @@
 /**
- * Emby API Adapter for Jellyfin Web v1.6.0
+ * Emby API Adapter for Jellyfin Web v1.6.2
  * 
  * Based on the stable ce25248 version, with targeted fixes:
  * 1. config.json interception: tells ConnectionManager the real Emby server URL
@@ -14,6 +14,7 @@
  * 10. PlaybackInfo UserId injection: ensures UserId in POST body and GET query params (v1.6.0)
  * 11. Emby client UA spoofing: disguises as official Emby Web client to avoid 401 errors (v1.6.1)
  * 12. Correct auth header format: uses MediaBrowser prefix and official client parameters (v1.6.1)
+ * 13. CORS preflight fix: skip auth headers & User-Agent on public endpoints to avoid preflight (v1.6.2)
  */
 
 (function() {
@@ -21,7 +22,7 @@
 
     // ==================== Configuration ====================
 
-    const ADAPTER_VERSION = '1.6.1';
+    const ADAPTER_VERSION = '1.6.2';
     const STORAGE_KEY = 'emby_adapter_config';
     const EMBY_TOKEN_KEY = 'emby_access_token';
     const EMBY_USER_KEY = 'emby_user_id';
@@ -29,7 +30,9 @@
     const EMBY_PREFIX_KEY = 'emby_needs_prefix';
     const SPOOFED_VERSION = '10.10.7';
     
-    // Official Emby Web Client User-Agent (for UA spoofing to avoid 401)
+    // Official Emby Web Client User-Agent (kept for reference; not injected into
+    // browser requests because User-Agent is a forbidden header and setting it
+    // via JS can trigger CORS preflight on some browsers)
     const EMBY_OFFICIAL_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0 EmbyWeb/4.8.8.0";
 
     // Paths that should NOT get the /emby/ prefix (static resources)
@@ -110,6 +113,27 @@
                 if (pathname.endsWith(ext)) return false;
             }
             return true;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    /**
+     * Check if this is a public API endpoint that does NOT require authentication.
+     * Public endpoints should not receive Authorization / X-Emby-Authorization headers
+     * because those non-simple headers trigger CORS preflight (OPTIONS) requests,
+     * which may fail if the server doesn't handle them correctly.
+     * (v1.6.2 fix)
+     */
+    function isPublicApiEndpoint(url) {
+        try {
+            const pathname = new URL(url).pathname.toLowerCase();
+            return pathname.endsWith('/system/info/public') ||
+                   pathname.endsWith('/emby/system/info/public') ||
+                   pathname.includes('/branding/configuration') ||
+                   pathname.includes('/emby/branding/configuration') ||
+                   pathname.includes('/branding/css') ||
+                   pathname.includes('/emby/branding/css');
         } catch (e) {
             return false;
         }
@@ -515,7 +539,14 @@
         return transformed;
     }
 
-    function transformHeaders(headers) {
+    /**
+     * Transform request headers for Emby compatibility.
+     * @param {Headers|Array|Object} headers - Original headers
+     * @param {boolean} skipAuth - If true, do NOT inject Authorization / X-Emby-Authorization
+     *   headers. Used for public endpoints (e.g. /System/Info/Public) to avoid
+     *   triggering CORS preflight requests. (v1.6.2)
+     */
+    function transformHeaders(headers, skipAuth) {
         const newHeaders = new Headers();
         let authValue = null;
 
@@ -544,24 +575,30 @@
             }
             if (lowerKey === 'authorization') {
                 authValue = transformAuthHeader(value);
-            } else if (lowerKey !== 'user-agent') { // Skip original User-Agent, we'll set our own
+            } else if (lowerKey !== 'user-agent') { // Skip original User-Agent
                 newHeaders.set(key, value);
             }
         }
 
-        // Set official Emby Web User-Agent to avoid 401
-        newHeaders.set('User-Agent', EMBY_OFFICIAL_UA);
-        
-        // Also add Accept header to match official client
+        // NOTE: User-Agent is a forbidden header in browsers — setting it via
+        // fetch()/XHR has no effect on the actual request, but having it in the
+        // Headers object can cause some browsers to trigger a CORS preflight.
+        // Removed in v1.6.2 to fix CORS issues on public endpoints.
+        // (Previously: newHeaders.set('User-Agent', EMBY_OFFICIAL_UA);)
+
+        // Accept and Accept-Language are CORS-safe headers — they never trigger preflight
         newHeaders.set('Accept', 'application/json, text/plain, */*');
         newHeaders.set('Accept-Language', 'zh-CN,zh;q=0.9,en;q=0.8');
 
-        if (authValue) {
-            newHeaders.set('Authorization', authValue);
-        } else if (embyAccessToken) {
-            newHeaders.set('Authorization', buildEmbyAuthHeaderValue(embyAccessToken));
-            // Also add X-Emby-Authorization header for compatibility
-            newHeaders.set('X-Emby-Authorization', buildEmbyAuthHeaderValue(embyAccessToken));
+        // Only inject auth headers for non-public endpoints (v1.6.2)
+        if (!skipAuth) {
+            if (authValue) {
+                newHeaders.set('Authorization', authValue);
+            } else if (embyAccessToken) {
+                newHeaders.set('Authorization', buildEmbyAuthHeaderValue(embyAccessToken));
+                // Also add X-Emby-Authorization header for compatibility
+                newHeaders.set('X-Emby-Authorization', buildEmbyAuthHeaderValue(embyAccessToken));
+            }
         }
         return newHeaders;
     }
@@ -664,7 +701,8 @@
             try {
                 const reqUrl = new URL(url, window.location.origin);
                 if (reqUrl.origin !== window.location.origin && options.headers) {
-                    const newHeaders = transformHeaders(options.headers);
+                    // Cross-origin non-Emby requests: skip auth to avoid CORS issues
+                    const newHeaders = transformHeaders(options.headers, true);
                     options = { ...options, headers: newHeaders };
                 }
             } catch (e) {}
@@ -690,8 +728,11 @@
             newUrl = ensurePlaybackInfoUserId(newUrl);
         }
 
-        // Transform headers (includes UA spoofing and auth header correction)
-        const newHeaders = transformHeaders(options.headers);
+        // Determine if this is a public endpoint that should skip auth headers (v1.6.2)
+        const isPublic = isPublicApiEndpoint(newUrl);
+
+        // Transform headers (skip auth for public endpoints to avoid CORS preflight)
+        const newHeaders = transformHeaders(options.headers, isPublic);
 
         const newOptions = {
             ...options,
@@ -718,7 +759,7 @@
             }
         }
 
-        log('Adapted to:', newUrl);
+        log('Adapted to:', newUrl, isPublic ? '(public, no auth)' : '(authenticated)');
 
         return originalFetch.call(this, newUrl, newOptions).then(response => {
             handleAuthResponse(url, response);
@@ -796,21 +837,28 @@
                     }
                 }
                 if (lowerName === 'x-emby-authorization') {
-                    const transformed = transformAuthHeader(value);
-                    this._embyHeaders['Authorization'] = transformed;
-                    return XHRSetHeader.call(this, 'Authorization', transformed);
+                    // Only inject auth for non-public endpoints (v1.6.2)
+                    if (!isPublicApiEndpoint(this._embyOriginalUrl)) {
+                        const transformed = transformAuthHeader(value);
+                        this._embyHeaders['Authorization'] = transformed;
+                        return XHRSetHeader.call(this, 'Authorization', transformed);
+                    }
                 }
                 return;
             }
             if (lowerName === 'authorization') {
-                const transformed = transformAuthHeader(value);
-                this._embyHeaders['Authorization'] = transformed;
-                return XHRSetHeader.call(this, 'Authorization', transformed);
+                // Only inject auth for non-public endpoints (v1.6.2)
+                if (!isPublicApiEndpoint(this._embyOriginalUrl)) {
+                    const transformed = transformAuthHeader(value);
+                    this._embyHeaders['Authorization'] = transformed;
+                    return XHRSetHeader.call(this, 'Authorization', transformed);
+                }
+                return; // Skip auth header for public endpoints
             }
             if (lowerName === 'user-agent') {
-                // Override with official Emby UA
-                this._embyHeaders['User-Agent'] = EMBY_OFFICIAL_UA;
-                return XHRSetHeader.call(this, 'User-Agent', EMBY_OFFICIAL_UA);
+                // User-Agent is a forbidden header in browsers — setting it via JS
+                // has no effect but can trigger CORS preflight. Skip it. (v1.6.2)
+                return;
             }
         }
         this._embyHeaders[name] = value;
@@ -873,13 +921,12 @@
                 body = transformPlaybackInfoBody(body);
             }
 
-            // Set official Emby User-Agent if not already set
-            if (!this._embyHeaders['User-Agent']) {
-                XHRSetHeader.call(this, 'User-Agent', EMBY_OFFICIAL_UA);
-                this._embyHeaders['User-Agent'] = EMBY_OFFICIAL_UA;
-            }
+            // v1.6.2: Do NOT set User-Agent — it is a forbidden header in browsers
+            // and setting it can trigger CORS preflight requests.
 
-            if (embyAccessToken && !this._embyHeaders['Authorization']) {
+            // v1.6.2: Only inject auth headers for non-public endpoints
+            const isPublic = isPublicApiEndpoint(this._embyOriginalUrl);
+            if (!isPublic && embyAccessToken && !this._embyHeaders['Authorization']) {
                 const authValue = buildEmbyAuthHeaderValue(embyAccessToken);
                 XHRSetHeader.call(this, 'Authorization', authValue);
                 // Also add X-Emby-Authorization header for compatibility
