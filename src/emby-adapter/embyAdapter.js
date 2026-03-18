@@ -1,17 +1,13 @@
 /**
- * Emby API Adapter for Jellyfin Web v1.4.0
+ * Emby API Adapter for Jellyfin Web v1.5.0
  * 
  * Based on the stable ce25248 version, with targeted fixes:
  * 1. config.json interception: tells ConnectionManager the real Emby server URL
  * 2. Version spoofing: replaces Emby 4.x version with 10.10.7
  * 3. Auto-detect /emby/ prefix: some Emby servers need it, some don't
  * 4. API route translation: rewrites Jellyfin-only API paths to Emby-compatible format
- * 
- * Key differences handled:
- * 1. URL prefix: Some Emby servers require /emby/ prefix, auto-detected
- * 2. Auth header: Uses "Emby" scheme in standard Authorization header
- * 3. Token passing: Embedded in Authorization header value
- * 4. API routes: Jellyfin SDK uses new flat routes; Emby requires /Users/{userId}/... format
+ * 5. PlaybackInfo body transform: strips Jellyfin-specific DeviceProfile fields for Emby
+ * 6. BitrateTest CORS workaround: returns synthetic response to avoid CORS preflight failure
  */
 
 (function() {
@@ -19,7 +15,7 @@
 
     // ==================== Configuration ====================
 
-    const ADAPTER_VERSION = '1.4.0';
+    const ADAPTER_VERSION = '1.5.0';
     const STORAGE_KEY = 'emby_adapter_config';
     const EMBY_TOKEN_KEY = 'emby_access_token';
     const EMBY_USER_KEY = 'emby_user_id';
@@ -40,7 +36,6 @@
     let embyAccessToken = localStorage.getItem(EMBY_TOKEN_KEY) || '';
     let embyUserId = localStorage.getItem(EMBY_USER_KEY) || '';
     let adapterEnabled = true;
-    // Whether the server needs /emby/ prefix. null = not yet detected.
     let needsEmbyPrefix = (() => {
         const stored = localStorage.getItem(EMBY_PREFIX_KEY);
         if (stored === 'true') return true;
@@ -60,9 +55,6 @@
         console.warn('[EmbyAdapter]', ...args);
     }
 
-    /**
-     * Check if a URL is a same-origin config.json request.
-     */
     function isConfigJsonRequest(url) {
         try {
             const u = new URL(url, window.location.origin);
@@ -73,29 +65,19 @@
         }
     }
 
-    /**
-     * Check if a URL points to the Emby server (API request vs static resource)
-     */
     function isEmbyApiRequest(url) {
         if (!embyServerUrl) return false;
-
         try {
             const parsed = new URL(url, window.location.origin);
             const serverParsed = new URL(embyServerUrl);
-
-            // Must match Emby server hostname
             if (parsed.hostname !== serverParsed.hostname) return false;
-            // Port check: for https default 443, for http default 80
             const parsedPort = parsed.port || (parsed.protocol === 'https:' ? '443' : '80');
             const serverPort = serverParsed.port || (serverParsed.protocol === 'https:' ? '443' : '80');
             if (parsedPort !== serverPort) return false;
-
-            // Static resources don't need adaptation
             const pathname = parsed.pathname.toLowerCase();
             for (const ext of STATIC_EXTENSIONS) {
                 if (pathname.endsWith(ext)) return false;
             }
-
             return true;
         } catch (e) {
             return false;
@@ -103,8 +85,30 @@
     }
 
     /**
-     * Check if response needs version spoofing.
+     * Check if this is a BitrateTest request (known to cause CORS issues).
      */
+    function isBitrateTestRequest(url) {
+        try {
+            const pathname = new URL(url).pathname.toLowerCase();
+            return pathname.includes('/playback/bitratetest') ||
+                   pathname.includes('/emby/playback/bitratetest');
+        } catch (e) {
+            return false;
+        }
+    }
+
+    /**
+     * Check if this is a PlaybackInfo POST request.
+     */
+    function isPlaybackInfoRequest(url) {
+        try {
+            const pathname = new URL(url).pathname.toLowerCase();
+            return pathname.includes('/playbackinfo');
+        } catch (e) {
+            return false;
+        }
+    }
+
     function needsVersionSpoof(url) {
         try {
             const pathname = new URL(url).pathname.toLowerCase();
@@ -117,9 +121,6 @@
         }
     }
 
-    /**
-     * Replace version in JSON response body.
-     */
     function spoofVersionInJson(bodyText) {
         try {
             const data = JSON.parse(bodyText);
@@ -137,12 +138,8 @@
         return bodyText;
     }
 
-    /**
-     * Conditionally add /emby/ prefix based on auto-detection result.
-     */
     function maybeAddEmbyPrefix(url) {
-        if (!needsEmbyPrefix) return url; // false or null => don't add
-
+        if (!needsEmbyPrefix) return url;
         try {
             const parsed = new URL(url);
             if (!parsed.pathname.toLowerCase().startsWith('/emby/') &&
@@ -159,63 +156,46 @@
     }
 
     // ==================== API Route Translation ====================
-    // Jellyfin SDK generates new-style flat routes; Emby 4.x only supports
-    // the old /Users/{userId}/... format. We must rewrite them.
 
-    /**
-     * Translate Jellyfin-only API paths to Emby-compatible paths.
-     * Returns the modified full URL string if translation was needed, or null.
-     */
     function translateJellyfinToEmbyUrl(url) {
         try {
             const parsed = new URL(url);
             const pathname = parsed.pathname;
             const params = parsed.searchParams;
-
-            // Get userId from query params or from stored state
             const userId = params.get('userId') || embyUserId;
-            if (!userId) return null; // can't translate without userId
+            if (!userId) return null;
 
             let newPathname = null;
-            let removeUserId = false; // whether to remove userId from query params
+            let removeUserId = false;
 
-            // --- Category 1: UserViews ---
-            // GET /UserViews?userId=xxx -> /Users/{userId}/Views
+            // UserViews
             if (/^\/UserViews$/i.test(pathname)) {
                 newPathname = '/Users/' + userId + '/Views';
                 removeUserId = true;
             }
-            // GET /UserViews/GroupingOptions?userId=xxx -> /Users/{userId}/GroupingOptions
             else if (/^\/UserViews\/GroupingOptions$/i.test(pathname)) {
                 newPathname = '/Users/' + userId + '/GroupingOptions';
                 removeUserId = true;
             }
-
-            // --- Category 2: Items ---
-            // GET /Items?userId=xxx -> /Users/{userId}/Items
+            // Items
             else if (/^\/Items$/i.test(pathname)) {
                 newPathname = '/Users/' + userId + '/Items';
                 removeUserId = true;
             }
-            // GET /Items/Suggestions?userId=xxx -> /Users/{userId}/Suggestions
             else if (/^\/Items\/Suggestions$/i.test(pathname)) {
                 newPathname = '/Users/' + userId + '/Suggestions';
                 removeUserId = true;
             }
-            // GET /Items/Root?userId=xxx -> /Users/{userId}/Items/Root
             else if (/^\/Items\/Root$/i.test(pathname)) {
                 newPathname = '/Users/' + userId + '/Items/Root';
                 removeUserId = true;
             }
-            // GET /Items/Latest?userId=xxx -> /Users/{userId}/Items/Latest
             else if (/^\/Items\/Latest$/i.test(pathname)) {
                 newPathname = '/Users/' + userId + '/Items/Latest';
                 removeUserId = true;
             }
-            // GET /Items/{itemId}?userId=xxx -> /Users/{userId}/Items/{itemId}
-            // Also handles /Items/{itemId}/Intros, /Items/{itemId}/LocalTrailers, /Items/{itemId}/SpecialFeatures
-            else if (/^\/Items\/([a-f0-9]+)(\/(?:Intros|LocalTrailers|SpecialFeatures))?$/i.test(pathname)) {
-                const match = pathname.match(/^\/Items\/([a-f0-9]+)(\/(?:Intros|LocalTrailers|SpecialFeatures))?$/i);
+            else if (/^\/Items\/([a-f0-9]+)(\/(?:Intros|LocalTrailers|SpecialFeatures|PlaybackInfo))?$/i.test(pathname)) {
+                const match = pathname.match(/^\/Items\/([a-f0-9]+)(\/(?:Intros|LocalTrailers|SpecialFeatures|PlaybackInfo))?$/i);
                 if (match) {
                     const itemId = match[1];
                     const suffix = match[2] || '';
@@ -223,14 +203,11 @@
                     removeUserId = true;
                 }
             }
-
-            // --- Category 3: UserItems ---
-            // GET /UserItems/Resume?userId=xxx -> /Users/{userId}/Items/Resume
+            // UserItems
             else if (/^\/UserItems\/Resume$/i.test(pathname)) {
                 newPathname = '/Users/' + userId + '/Items/Resume';
                 removeUserId = true;
             }
-            // GET/POST /UserItems/{itemId}/UserData?userId=xxx -> /Users/{userId}/Items/{itemId}/UserData
             else if (/^\/UserItems\/([a-f0-9]+)\/UserData$/i.test(pathname)) {
                 const match = pathname.match(/^\/UserItems\/([a-f0-9]+)\/UserData$/i);
                 if (match) {
@@ -238,8 +215,6 @@
                     removeUserId = true;
                 }
             }
-            // POST /UserItems/{itemId}/Rating?userId=xxx -> /Users/{userId}/Items/{itemId}/Rating
-            // DELETE /UserItems/{itemId}/Rating?userId=xxx -> /Users/{userId}/Items/{itemId}/Rating
             else if (/^\/UserItems\/([a-f0-9]+)\/Rating$/i.test(pathname)) {
                 const match = pathname.match(/^\/UserItems\/([a-f0-9]+)\/Rating$/i);
                 if (match) {
@@ -247,9 +222,7 @@
                     removeUserId = true;
                 }
             }
-
-            // --- Category 4: UserFavoriteItems ---
-            // POST/DELETE /UserFavoriteItems/{itemId}?userId=xxx -> /Users/{userId}/FavoriteItems/{itemId}
+            // UserFavoriteItems
             else if (/^\/UserFavoriteItems\/([a-f0-9]+)$/i.test(pathname)) {
                 const match = pathname.match(/^\/UserFavoriteItems\/([a-f0-9]+)$/i);
                 if (match) {
@@ -257,9 +230,7 @@
                     removeUserId = true;
                 }
             }
-
-            // --- Category 5: UserPlayedItems ---
-            // POST/DELETE /UserPlayedItems/{itemId}?userId=xxx -> /Users/{userId}/PlayedItems/{itemId}
+            // UserPlayedItems
             else if (/^\/UserPlayedItems\/([a-f0-9]+)$/i.test(pathname)) {
                 const match = pathname.match(/^\/UserPlayedItems\/([a-f0-9]+)$/i);
                 if (match) {
@@ -267,42 +238,27 @@
                     removeUserId = true;
                 }
             }
-
-            // --- Category 6: PlayingItems (session-based, no userId in path) ---
-            // POST /PlayingItems/{itemId} -> /Users/{userId}/PlayingItems/{itemId}
-            // POST /PlayingItems/{itemId}/Progress -> /Users/{userId}/PlayingItems/{itemId}/Progress
-            // DELETE /PlayingItems/{itemId} -> /Users/{userId}/PlayingItems/{itemId}
+            // PlayingItems
             else if (/^\/PlayingItems\/([a-f0-9]+)(\/Progress)?$/i.test(pathname)) {
                 const match = pathname.match(/^\/PlayingItems\/([a-f0-9]+)(\/Progress)?$/i);
                 if (match) {
-                    const itemId = match[1];
-                    const suffix = match[2] || '';
-                    newPathname = '/Users/' + userId + '/PlayingItems/' + itemId + suffix;
+                    newPathname = '/Users/' + userId + '/PlayingItems/' + match[1] + (match[2] || '');
                 }
             }
-
-            // --- Category 7: UserImage ---
-            // GET/POST/DELETE /UserImage?userId=xxx -> /Users/{userId}/Images/{imageType}
+            // UserImage
             else if (/^\/UserImage$/i.test(pathname)) {
                 const imageType = params.get('imageType') || 'Primary';
                 const imageIndex = params.get('imageIndex');
-                if (imageIndex != null) {
-                    newPathname = '/Users/' + userId + '/Images/' + imageType + '/' + imageIndex;
-                } else {
-                    newPathname = '/Users/' + userId + '/Images/' + imageType;
-                }
+                newPathname = '/Users/' + userId + '/Images/' + imageType + (imageIndex != null ? '/' + imageIndex : '');
                 removeUserId = true;
                 params.delete('imageType');
                 params.delete('imageIndex');
             }
-
-            // --- Category 8: User Management ---
-            // POST /Users/Password?userId=xxx -> /Users/{userId}/Password
+            // User Management
             else if (/^\/Users\/Password$/i.test(pathname)) {
                 newPathname = '/Users/' + userId + '/Password';
                 removeUserId = true;
             }
-            // POST /Users/Configuration?userId=xxx -> /Users/{userId}/Configuration
             else if (/^\/Users\/Configuration$/i.test(pathname)) {
                 newPathname = '/Users/' + userId + '/Configuration';
                 removeUserId = true;
@@ -316,18 +272,155 @@
                 log('Route translated:', pathname, '->', newPathname);
                 return parsed.toString();
             }
-
         } catch (e) {
             warn('Route translation error:', e);
         }
         return null;
     }
 
-    // ==================== Auth Header Helpers ====================
+    // ==================== PlaybackInfo Body Transform ====================
 
     /**
-     * Build the Emby auth header value.
+     * Jellyfin-only VideoRangeType values that Emby 4.x does not recognize.
      */
+    const JELLYFIN_ONLY_VIDEO_RANGE_TYPES = ['DOVIWithSDR', 'DOVIWithHDR10', 'DOVIWithHLG'];
+
+    /**
+     * Jellyfin-only condition properties that Emby may not support.
+     */
+    const JELLYFIN_ONLY_CONDITION_PROPS = ['IsSecondaryAudio'];
+
+    /**
+     * Clean a DeviceProfile object for Emby compatibility.
+     * Removes Jellyfin-specific fields that Emby 4.x doesn't understand,
+     * which would cause Emby to return "NoCompatibleStream".
+     */
+    function cleanDeviceProfileForEmby(profile) {
+        if (!profile) return profile;
+
+        // Deep clone to avoid mutating the original
+        const p = JSON.parse(JSON.stringify(profile));
+
+        // --- TranscodingProfiles: strip Jellyfin-only fields ---
+        if (Array.isArray(p.TranscodingProfiles)) {
+            p.TranscodingProfiles = p.TranscodingProfiles.map(tp => {
+                delete tp.EnableAudioVbrEncoding;
+                delete tp.ApplyConditions;
+                return tp;
+            });
+        }
+
+        // --- CodecProfiles: strip Jellyfin-only fields & sanitize conditions ---
+        if (Array.isArray(p.CodecProfiles)) {
+            p.CodecProfiles = p.CodecProfiles.map(cp => {
+                delete cp.Container;
+                delete cp.SubContainer;
+                delete cp.ApplyConditions;
+
+                // Sanitize Conditions
+                if (Array.isArray(cp.Conditions)) {
+                    cp.Conditions = cp.Conditions
+                        .filter(c => {
+                            // Remove conditions using Jellyfin-only properties
+                            if (JELLYFIN_ONLY_CONDITION_PROPS.includes(c.Property)) return false;
+                            return true;
+                        })
+                        .map(c => {
+                            // Clean VideoRangeType values
+                            if (c.Property === 'VideoRangeType' && c.Value) {
+                                const values = c.Value.split('|')
+                                    .filter(v => !JELLYFIN_ONLY_VIDEO_RANGE_TYPES.includes(v));
+                                if (values.length === 0) return null; // remove empty condition
+                                c.Value = values.join('|');
+                            }
+                            return c;
+                        })
+                        .filter(Boolean);
+                }
+
+                return cp;
+            });
+        }
+
+        // --- DirectPlayProfiles: remove HLS direct play (Jellyfin-only concept) ---
+        if (Array.isArray(p.DirectPlayProfiles)) {
+            p.DirectPlayProfiles = p.DirectPlayProfiles.filter(dp => {
+                return dp.Container !== 'hls';
+            });
+        }
+
+        // --- SubtitleProfiles: Emby is mostly compatible, but clean up edge cases ---
+        if (Array.isArray(p.SubtitleProfiles)) {
+            p.SubtitleProfiles = p.SubtitleProfiles.map(sp => {
+                // Emby doesn't support all subtitle methods Jellyfin does
+                // But the basic ones (Encode, Embed, External, Drop) are shared
+                return sp;
+            });
+        }
+
+        log('DeviceProfile cleaned for Emby compatibility');
+        return p;
+    }
+
+    /**
+     * Transform a PlaybackInfo POST body for Emby compatibility.
+     * Strips Jellyfin-specific fields from the top-level DTO and the nested DeviceProfile.
+     */
+    function transformPlaybackInfoBody(bodyText) {
+        try {
+            const body = JSON.parse(bodyText);
+
+            // Strip Jellyfin-specific top-level fields
+            delete body.AlwaysBurnInSubtitleWhenTranscoding;
+            delete body.EnableTranscoding;
+            delete body.SecondarySubtitleStreamIndex;
+            delete body.EnableMediaProbe;
+            delete body.DirectPlayProtocols;
+            delete body.IsPlayback;
+
+            // Clean the nested DeviceProfile
+            if (body.DeviceProfile) {
+                body.DeviceProfile = cleanDeviceProfileForEmby(body.DeviceProfile);
+            }
+
+            log('PlaybackInfo body transformed for Emby');
+            return JSON.stringify(body);
+        } catch (e) {
+            warn('PlaybackInfo body transform error:', e);
+            return bodyText;
+        }
+    }
+
+    /**
+     * Create a synthetic BitrateTest response to avoid CORS issues.
+     * The client uses this to estimate bandwidth; returning a fast response
+     * with the requested data size makes it assume high bandwidth,
+     * allowing direct play to be preferred over transcoding.
+     */
+    function createBitrateTestResponse(url) {
+        let size = 500000; // default
+        try {
+            const parsed = new URL(url);
+            const sizeParam = parsed.searchParams.get('Size') || parsed.searchParams.get('size');
+            if (sizeParam) size = parseInt(sizeParam, 10) || 500000;
+        } catch (e) {}
+
+        log('BitrateTest intercepted, returning synthetic', size, 'byte response');
+
+        // Return a buffer of the requested size filled with zeros
+        const buffer = new ArrayBuffer(size);
+        return new Response(buffer, {
+            status: 200,
+            statusText: 'OK',
+            headers: {
+                'Content-Type': 'application/octet-stream',
+                'Content-Length': String(size)
+            }
+        });
+    }
+
+    // ==================== Auth Header Helpers ====================
+
     function buildEmbyAuthHeaderValue(token) {
         const deviceId = localStorage.getItem('emby_device_id') ||
                         ('emby-web-' + Math.random().toString(36).substr(2, 9));
@@ -343,33 +436,23 @@
         if (token) {
             value += ', Token="' + token + '"';
         }
-
         return value;
     }
 
-    /**
-     * Transform Jellyfin auth header to Emby format.
-     */
     function transformAuthHeader(value) {
         if (!value) return value;
-
         let transformed = value;
         if (transformed.startsWith('MediaBrowser ')) {
             transformed = 'Emby ' + transformed.substring('MediaBrowser '.length);
         } else if (transformed.startsWith('Jellyfin ')) {
             transformed = 'Emby ' + transformed.substring('Jellyfin '.length);
         }
-
         if (embyAccessToken && !transformed.includes('Token=')) {
             transformed += ', Token="' + embyAccessToken + '"';
         }
-
         return transformed;
     }
 
-    /**
-     * Transform request headers for Emby compatibility.
-     */
     function transformHeaders(headers) {
         const newHeaders = new Headers();
         let authValue = null;
@@ -385,7 +468,6 @@
 
         for (const [key, value] of entries) {
             const lowerKey = key.toLowerCase();
-
             if (lowerKey.startsWith('x-emby-') || lowerKey.startsWith('x-mediabrowser-')) {
                 if ((lowerKey === 'x-emby-token' || lowerKey === 'x-mediabrowser-token') && value) {
                     if (!embyAccessToken) {
@@ -398,7 +480,6 @@
                 }
                 continue;
             }
-
             if (lowerKey === 'authorization') {
                 authValue = transformAuthHeader(value);
             } else {
@@ -411,13 +492,9 @@
         } else if (embyAccessToken) {
             newHeaders.set('Authorization', buildEmbyAuthHeaderValue(embyAccessToken));
         }
-
         return newHeaders;
     }
 
-    /**
-     * Handle authentication response - extract and store token
-     */
     function handleAuthResponse(url, response) {
         if (typeof url === 'string' && url.includes('/Users/AuthenticateByName')) {
             const cloned = response.clone();
@@ -433,7 +510,6 @@
                 log('Failed to parse auth response:', e);
             });
         }
-
         if (typeof url === 'string' && url.includes('/Sessions/Logout')) {
             embyAccessToken = '';
             embyUserId = '';
@@ -443,9 +519,6 @@
         }
     }
 
-    /**
-     * Generate a synthetic config.json response.
-     */
     function createConfigJsonResponse() {
         const config = {};
         if (embyServerUrl) {
@@ -455,7 +528,6 @@
         config.multiserver = false;
 
         log('config.json intercepted, servers:', config.servers || '(none)');
-
         return new Response(JSON.stringify(config), {
             status: 200,
             statusText: 'OK',
@@ -465,19 +537,10 @@
 
     // ==================== Core URL Adaptation ====================
 
-    /**
-     * Full URL adaptation pipeline for Emby compatibility:
-     * 1. Translate Jellyfin-only routes to Emby format
-     * 2. Conditionally add /emby/ prefix
-     */
     function adaptUrlForEmby(url) {
-        // Step 1: Translate Jellyfin SDK routes to Emby-compatible routes
         const translated = translateJellyfinToEmbyUrl(url);
         let result = translated || url;
-
-        // Step 2: Conditionally add /emby/ prefix
         result = maybeAddEmbyPrefix(result);
-
         return result;
     }
 
@@ -519,7 +582,6 @@
 
         // ---- Only modify requests going to the Emby server ----
         if (!isEmbyApiRequest(url)) {
-            // For ANY cross-origin request, still strip X-Emby-* headers for CORS safety
             try {
                 const reqUrl = new URL(url, window.location.origin);
                 if (reqUrl.origin !== window.location.origin && options.headers) {
@@ -532,6 +594,11 @@
 
         log('Intercepting fetch:', url);
 
+        // ---- BitrateTest: return synthetic response to avoid CORS issues ----
+        if (isBitrateTestRequest(url)) {
+            return Promise.resolve(createBitrateTestResponse(url));
+        }
+
         // Full adaptation: route translation + optional prefix
         const newUrl = adaptUrlForEmby(url);
 
@@ -542,6 +609,26 @@
             ...options,
             headers: newHeaders
         };
+
+        // ---- PlaybackInfo: transform POST body for Emby compatibility ----
+        if (isPlaybackInfoRequest(newUrl) && options.body) {
+            try {
+                let bodyText = options.body;
+                if (typeof bodyText !== 'string') {
+                    // If body is a ReadableStream or other type, try to get it as text
+                    if (bodyText instanceof Blob) {
+                        // Can't synchronously convert Blob, handle async below
+                    } else {
+                        bodyText = String(bodyText);
+                    }
+                }
+                if (typeof bodyText === 'string') {
+                    newOptions.body = transformPlaybackInfoBody(bodyText);
+                }
+            } catch (e) {
+                warn('PlaybackInfo body intercept error:', e);
+            }
+        }
 
         log('Adapted to:', newUrl);
 
@@ -576,6 +663,7 @@
         this._embyHeaders = {};
         this._embyAdapted = false;
         this._embyIsConfigJson = false;
+        this._embyIsBitrateTest = false;
 
         let adaptedUrl = url;
 
@@ -585,8 +673,16 @@
         }
 
         if (adapterEnabled && isEmbyApiRequest(String(url))) {
+            // BitrateTest: flag for synthetic response in send()
+            if (isBitrateTestRequest(String(url))) {
+                this._embyIsBitrateTest = true;
+                this._embyAdapted = true;
+                return XHROpen.call(this, method, adaptedUrl, async !== false, user, password);
+            }
+
             adaptedUrl = adaptUrlForEmby(String(url));
             this._embyAdapted = true;
+            this._embyIsPlaybackInfo = isPlaybackInfoRequest(adaptedUrl);
             log('XHR Intercepting:', url, '->', adaptedUrl);
         }
 
@@ -596,7 +692,6 @@
     XMLHttpRequest.prototype.setRequestHeader = function(name, value) {
         if (this._embyAdapted) {
             const lowerName = name.toLowerCase();
-
             if (lowerName.startsWith('x-emby-') || lowerName.startsWith('x-mediabrowser-')) {
                 if ((lowerName === 'x-emby-token' || lowerName === 'x-mediabrowser-token') && value) {
                     if (!embyAccessToken) {
@@ -611,7 +706,6 @@
                 }
                 return;
             }
-
             if (lowerName === 'authorization') {
                 const transformed = transformAuthHeader(value);
                 this._embyHeaders['Authorization'] = transformed;
@@ -623,6 +717,7 @@
     };
 
     XMLHttpRequest.prototype.send = function(body) {
+        // config.json interception
         if (this._embyIsConfigJson) {
             const self = this;
             const configData = JSON.stringify({
@@ -637,9 +732,33 @@
                 Object.defineProperty(self, 'statusText', { value: 'OK', writable: false, configurable: true });
                 Object.defineProperty(self, 'responseText', { value: configData, writable: false, configurable: true });
                 Object.defineProperty(self, 'response', { value: configData, writable: false, configurable: true });
-                if (typeof self.onreadystatechange === 'function') {
-                    self.onreadystatechange();
-                }
+                if (typeof self.onreadystatechange === 'function') self.onreadystatechange();
+                self.dispatchEvent(new Event('readystatechange'));
+                self.dispatchEvent(new Event('load'));
+                self.dispatchEvent(new Event('loadend'));
+            }, 0);
+            return;
+        }
+
+        // BitrateTest: return synthetic response
+        if (this._embyIsBitrateTest) {
+            const self = this;
+            let size = 500000;
+            try {
+                const parsed = new URL(self._embyOriginalUrl);
+                const sizeParam = parsed.searchParams.get('Size') || parsed.searchParams.get('size');
+                if (sizeParam) size = parseInt(sizeParam, 10) || 500000;
+            } catch (e) {}
+            log('XHR BitrateTest intercepted, size:', size);
+
+            const buffer = new ArrayBuffer(size);
+            setTimeout(function() {
+                Object.defineProperty(self, 'readyState', { value: 4, writable: false, configurable: true });
+                Object.defineProperty(self, 'status', { value: 200, writable: false, configurable: true });
+                Object.defineProperty(self, 'statusText', { value: 'OK', writable: false, configurable: true });
+                Object.defineProperty(self, 'response', { value: buffer, writable: false, configurable: true });
+                Object.defineProperty(self, 'responseText', { value: '', writable: false, configurable: true });
+                if (typeof self.onreadystatechange === 'function') self.onreadystatechange();
                 self.dispatchEvent(new Event('readystatechange'));
                 self.dispatchEvent(new Event('load'));
                 self.dispatchEvent(new Event('loadend'));
@@ -648,6 +767,11 @@
         }
 
         if (this._embyAdapted) {
+            // Transform PlaybackInfo body
+            if (this._embyIsPlaybackInfo && body && typeof body === 'string') {
+                body = transformPlaybackInfoBody(body);
+            }
+
             if (embyAccessToken && !this._embyHeaders['Authorization']) {
                 const authValue = buildEmbyAuthHeaderValue(embyAccessToken);
                 XHRSetHeader.call(this, 'Authorization', authValue);
@@ -692,42 +816,29 @@
 
     function setupImageObserver() {
         if (!embyServerUrl) return;
-
         const observer = new MutationObserver(mutations => {
             for (const mutation of mutations) {
                 for (const node of mutation.addedNodes) {
-                    if (node.nodeType === Node.ELEMENT_NODE) {
-                        adaptImageUrls(node);
-                    }
+                    if (node.nodeType === Node.ELEMENT_NODE) adaptImageUrls(node);
                 }
             }
         });
-
-        observer.observe(document.documentElement, {
-            childList: true,
-            subtree: true
-        });
-
+        observer.observe(document.documentElement, { childList: true, subtree: true });
         document.querySelectorAll('img').forEach(adaptImageElement);
     }
 
     function adaptImageUrls(element) {
-        if (element.tagName === 'IMG') {
-            adaptImageElement(element);
-        }
+        if (element.tagName === 'IMG') adaptImageElement(element);
         element.querySelectorAll && element.querySelectorAll('img').forEach(adaptImageElement);
     }
 
     function adaptImageElement(img) {
         const src = img.getAttribute('src');
         if (!src || !embyServerUrl || !embyAccessToken) return;
-
         try {
             const srcUrl = new URL(src, window.location.origin);
             const serverUrl = new URL(embyServerUrl);
-
             if (srcUrl.hostname === serverUrl.hostname && !srcUrl.searchParams.has('api_key')) {
-                // Only add /emby/ prefix if the server needs it
                 if (needsEmbyPrefix && !srcUrl.pathname.startsWith('/emby/')) {
                     srcUrl.pathname = '/emby' + srcUrl.pathname;
                 }
@@ -746,18 +857,13 @@
             try {
                 const wsUrl = new URL(url);
                 const serverUrl = new URL(embyServerUrl);
-
-                // If WebSocket is going to same-origin (GitHub Pages), redirect to Emby server
                 if (wsUrl.hostname === window.location.hostname) {
                     wsUrl.protocol = serverUrl.protocol === 'https:' ? 'wss:' : 'ws:';
                     wsUrl.hostname = serverUrl.hostname;
                     wsUrl.port = serverUrl.port;
                     log('WebSocket redirected to Emby server:', wsUrl.toString());
                 }
-
-                // If WebSocket is going to the Emby server
                 if (wsUrl.hostname === serverUrl.hostname) {
-                    // Only add /emby prefix if server needs it
                     if (needsEmbyPrefix && !wsUrl.pathname.startsWith('/emby')) {
                         wsUrl.pathname = '/emby' + wsUrl.pathname;
                     }
@@ -786,39 +892,28 @@
 
         setServerUrl: function(url) {
             let normalized = url.trim().replace(/\/+$/, '');
-            if (!/^https?:\/\//i.test(normalized)) {
-                normalized = 'http://' + normalized;
-            }
+            if (!/^https?:\/\//i.test(normalized)) normalized = 'http://' + normalized;
             embyServerUrl = normalized;
             localStorage.setItem(EMBY_SERVER_KEY, embyServerUrl);
             log('Server URL set:', embyServerUrl);
         },
 
-        getServerUrl: function() {
-            return embyServerUrl;
-        },
+        getServerUrl: function() { return embyServerUrl; },
 
         setAccessToken: function(token) {
             embyAccessToken = token;
             localStorage.setItem(EMBY_TOKEN_KEY, token);
         },
 
-        getAccessToken: function() {
-            return embyAccessToken;
-        },
-
-        getUserId: function() {
-            return embyUserId;
-        },
+        getAccessToken: function() { return embyAccessToken; },
+        getUserId: function() { return embyUserId; },
 
         setEnabled: function(enabled) {
             adapterEnabled = enabled;
             log('Adapter', enabled ? 'enabled' : 'disabled');
         },
 
-        isEnabled: function() {
-            return adapterEnabled;
-        },
+        isEnabled: function() { return adapterEnabled; },
 
         clearCredentials: function() {
             embyAccessToken = '';
@@ -834,60 +929,40 @@
             localStorage.removeItem('emby_server_id');
         },
 
-        /**
-         * Test connection to Emby server.
-         * Also auto-detects whether the server needs /emby/ prefix.
-         */
         testConnection: async function(serverUrl) {
             let baseUrl = serverUrl || embyServerUrl;
             baseUrl = baseUrl.trim().replace(/\/+$/, '');
-            if (!/^https?:\/\//i.test(baseUrl)) {
-                baseUrl = 'http://' + baseUrl;
-            }
+            if (!/^https?:\/\//i.test(baseUrl)) baseUrl = 'http://' + baseUrl;
 
-            // Try WITHOUT /emby/ prefix first (more common for newer Emby setups)
             let url = baseUrl + '/System/Info/Public';
             try {
                 let resp = await originalFetch(url, {
                     method: 'GET',
                     headers: { 'Content-Type': 'application/json' }
                 });
-
                 if (resp.ok) {
                     const data = await resp.json();
                     needsEmbyPrefix = false;
                     localStorage.setItem(EMBY_PREFIX_KEY, 'false');
                     log('Server does NOT need /emby/ prefix');
-                    return {
-                        success: true,
-                        serverName: data.ServerName,
-                        version: data.Version,
-                        id: data.Id
-                    };
+                    return { success: true, serverName: data.ServerName, version: data.Version, id: data.Id };
                 }
             } catch (e) {
                 log('No-prefix test failed, trying with /emby/:', e.message);
             }
 
-            // Try WITH /emby/ prefix (some setups require it)
             url = baseUrl + '/emby/System/Info/Public';
             try {
                 let resp = await originalFetch(url, {
                     method: 'GET',
                     headers: { 'Content-Type': 'application/json' }
                 });
-
                 if (resp.ok) {
                     const data = await resp.json();
                     needsEmbyPrefix = true;
                     localStorage.setItem(EMBY_PREFIX_KEY, 'true');
                     log('Server NEEDS /emby/ prefix');
-                    return {
-                        success: true,
-                        serverName: data.ServerName,
-                        version: data.Version,
-                        id: data.Id
-                    };
+                    return { success: true, serverName: data.ServerName, version: data.Version, id: data.Id };
                 }
                 return { success: false, error: 'HTTP ' + resp.status };
             } catch (e) {
@@ -895,15 +970,9 @@
             }
         },
 
-        /**
-         * Authenticate with Emby server.
-         * Uses the detected prefix setting.
-         */
         authenticate: async function(serverUrl, username, password) {
             let baseUrl = (serverUrl || embyServerUrl).trim().replace(/\/+$/, '');
-            if (!/^https?:\/\//i.test(baseUrl)) {
-                baseUrl = 'http://' + baseUrl;
-            }
+            if (!/^https?:\/\//i.test(baseUrl)) baseUrl = 'http://' + baseUrl;
 
             const prefix = needsEmbyPrefix ? '/emby' : '';
             const url = baseUrl + prefix + '/Users/AuthenticateByName';
@@ -916,10 +985,7 @@
                         'Content-Type': 'application/json',
                         'Authorization': authValue
                     },
-                    body: JSON.stringify({
-                        Username: username,
-                        Pw: password
-                    })
+                    body: JSON.stringify({ Username: username, Pw: password })
                 });
 
                 if (!resp.ok) {
@@ -928,7 +994,6 @@
                 }
 
                 const data = await resp.json();
-
                 embyAccessToken = data.AccessToken;
                 embyUserId = data.User.Id;
                 embyServerUrl = baseUrl;
