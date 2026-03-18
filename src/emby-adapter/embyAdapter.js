@@ -1,5 +1,5 @@
 /**
- * Emby API Adapter for Jellyfin Web v1.5.0
+ * Emby API Adapter for Jellyfin Web v1.6.0
  * 
  * Based on the stable ce25248 version, with targeted fixes:
  * 1. config.json interception: tells ConnectionManager the real Emby server URL
@@ -8,6 +8,10 @@
  * 4. API route translation: rewrites Jellyfin-only API paths to Emby-compatible format
  * 5. PlaybackInfo body transform: strips Jellyfin-specific DeviceProfile fields for Emby
  * 6. BitrateTest CORS workaround: returns synthetic response to avoid CORS preflight failure
+ * 7. Double-slash prevention: collapses duplicate slashes in URL pathnames (v1.6.0)
+ * 8. PlaybackInfo route fix: no longer translates to /Users/{id}/Items/{id}/PlaybackInfo (v1.6.0)
+ * 9. Broadened item ID matching: supports numeric and alphanumeric IDs (v1.6.0)
+ * 10. PlaybackInfo UserId injection: ensures UserId in POST body and GET query params (v1.6.0)
  */
 
 (function() {
@@ -15,7 +19,7 @@
 
     // ==================== Configuration ====================
 
-    const ADAPTER_VERSION = '1.5.0';
+    const ADAPTER_VERSION = '1.6.0';
     const STORAGE_KEY = 'emby_adapter_config';
     const EMBY_TOKEN_KEY = 'emby_access_token';
     const EMBY_USER_KEY = 'emby_user_id';
@@ -53,6 +57,28 @@
 
     function warn(...args) {
         console.warn('[EmbyAdapter]', ...args);
+    }
+
+    /**
+     * Get the current user ID from adapter state.
+     */
+    function getUserId() {
+        return embyUserId || localStorage.getItem(EMBY_USER_KEY) || '';
+    }
+
+    /**
+     * Sanitize a URL by collapsing double (or more) slashes in the pathname.
+     * Preserves the protocol's double slash (e.g. https://).
+     */
+    function sanitizeUrl(url) {
+        try {
+            const parsed = new URL(url);
+            parsed.pathname = parsed.pathname.replace(/\/\/+/g, '/');
+            return parsed.toString();
+        } catch (e) {
+            // For relative URLs, collapse double slashes but not after the colon in protocol
+            return url.replace(/([^:])\/\/+/g, '$1/');
+        }
     }
 
     function isConfigJsonRequest(url) {
@@ -155,6 +181,27 @@
         }
     }
 
+    /**
+     * Ensure UserId is present as a query parameter for PlaybackInfo GET requests.
+     * The Emby API expects: GET /Items/{Id}/PlaybackInfo?UserId={userId}
+     */
+    function ensurePlaybackInfoUserId(url) {
+        try {
+            const parsed = new URL(url);
+            if (!parsed.searchParams.has('UserId') && !parsed.searchParams.has('userId')) {
+                const userId = getUserId();
+                if (userId) {
+                    parsed.searchParams.set('UserId', userId);
+                    log('Added UserId query param to PlaybackInfo GET request');
+                    return parsed.toString();
+                }
+            }
+        } catch (e) {
+            warn('ensurePlaybackInfoUserId error:', e);
+        }
+        return url;
+    }
+
     // ==================== API Route Translation ====================
 
     function translateJellyfinToEmbyUrl(url) {
@@ -162,7 +209,7 @@
             const parsed = new URL(url);
             const pathname = parsed.pathname;
             const params = parsed.searchParams;
-            const userId = params.get('userId') || embyUserId;
+            const userId = params.get('userId') || getUserId();
             if (!userId) return null;
 
             let newPathname = null;
@@ -194,8 +241,10 @@
                 newPathname = '/Users/' + userId + '/Items/Latest';
                 removeUserId = true;
             }
-            else if (/^\/Items\/([a-f0-9]+)(\/(?:Intros|LocalTrailers|SpecialFeatures|PlaybackInfo))?$/i.test(pathname)) {
-                const match = pathname.match(/^\/Items\/([a-f0-9]+)(\/(?:Intros|LocalTrailers|SpecialFeatures|PlaybackInfo))?$/i);
+            // Items/{id} with optional suffix - NOTE: PlaybackInfo is EXCLUDED here
+            // Emby's PlaybackInfo endpoint is POST /Items/{Id}/PlaybackInfo (not under /Users/)
+            else if (/^\/Items\/([^\/]+)(\/(?:Intros|LocalTrailers|SpecialFeatures))?$/i.test(pathname)) {
+                const match = pathname.match(/^\/Items\/([^\/]+)(\/(?:Intros|LocalTrailers|SpecialFeatures))?$/i);
                 if (match) {
                     const itemId = match[1];
                     const suffix = match[2] || '';
@@ -208,39 +257,39 @@
                 newPathname = '/Users/' + userId + '/Items/Resume';
                 removeUserId = true;
             }
-            else if (/^\/UserItems\/([a-f0-9]+)\/UserData$/i.test(pathname)) {
-                const match = pathname.match(/^\/UserItems\/([a-f0-9]+)\/UserData$/i);
+            else if (/^\/UserItems\/([^\/]+)\/UserData$/i.test(pathname)) {
+                const match = pathname.match(/^\/UserItems\/([^\/]+)\/UserData$/i);
                 if (match) {
                     newPathname = '/Users/' + userId + '/Items/' + match[1] + '/UserData';
                     removeUserId = true;
                 }
             }
-            else if (/^\/UserItems\/([a-f0-9]+)\/Rating$/i.test(pathname)) {
-                const match = pathname.match(/^\/UserItems\/([a-f0-9]+)\/Rating$/i);
+            else if (/^\/UserItems\/([^\/]+)\/Rating$/i.test(pathname)) {
+                const match = pathname.match(/^\/UserItems\/([^\/]+)\/Rating$/i);
                 if (match) {
                     newPathname = '/Users/' + userId + '/Items/' + match[1] + '/Rating';
                     removeUserId = true;
                 }
             }
             // UserFavoriteItems
-            else if (/^\/UserFavoriteItems\/([a-f0-9]+)$/i.test(pathname)) {
-                const match = pathname.match(/^\/UserFavoriteItems\/([a-f0-9]+)$/i);
+            else if (/^\/UserFavoriteItems\/([^\/]+)$/i.test(pathname)) {
+                const match = pathname.match(/^\/UserFavoriteItems\/([^\/]+)$/i);
                 if (match) {
                     newPathname = '/Users/' + userId + '/FavoriteItems/' + match[1];
                     removeUserId = true;
                 }
             }
             // UserPlayedItems
-            else if (/^\/UserPlayedItems\/([a-f0-9]+)$/i.test(pathname)) {
-                const match = pathname.match(/^\/UserPlayedItems\/([a-f0-9]+)$/i);
+            else if (/^\/UserPlayedItems\/([^\/]+)$/i.test(pathname)) {
+                const match = pathname.match(/^\/UserPlayedItems\/([^\/]+)$/i);
                 if (match) {
                     newPathname = '/Users/' + userId + '/PlayedItems/' + match[1];
                     removeUserId = true;
                 }
             }
             // PlayingItems
-            else if (/^\/PlayingItems\/([a-f0-9]+)(\/Progress)?$/i.test(pathname)) {
-                const match = pathname.match(/^\/PlayingItems\/([a-f0-9]+)(\/Progress)?$/i);
+            else if (/^\/PlayingItems\/([^\/]+)(\/Progress)?$/i.test(pathname)) {
+                const match = pathname.match(/^\/PlayingItems\/([^\/]+)(\/Progress)?$/i);
                 if (match) {
                     newPathname = '/Users/' + userId + '/PlayingItems/' + match[1] + (match[2] || '');
                 }
@@ -365,10 +414,21 @@
     /**
      * Transform a PlaybackInfo POST body for Emby compatibility.
      * Strips Jellyfin-specific fields from the top-level DTO and the nested DeviceProfile.
+     * Also ensures UserId is present in the body (required by Emby's /Items/{Id}/PlaybackInfo).
      */
     function transformPlaybackInfoBody(bodyText) {
         try {
             const body = JSON.parse(bodyText);
+
+            // Ensure UserId is in the body (Bug 4 fix)
+            // Emby's POST /Items/{Id}/PlaybackInfo expects UserId in the request body
+            if (!body.UserId) {
+                const userId = getUserId();
+                if (userId) {
+                    body.UserId = userId;
+                    log('Injected UserId into PlaybackInfo body:', userId);
+                }
+            }
 
             // Strip Jellyfin-specific top-level fields
             delete body.AlwaysBurnInSubtitleWhenTranscoding;
@@ -541,7 +601,15 @@
         const translated = translateJellyfinToEmbyUrl(url);
         let result = translated || url;
         result = maybeAddEmbyPrefix(result);
-        return result;
+        // Collapse double slashes in pathname (Bug 1 fix)
+        try {
+            const parsed = new URL(result);
+            parsed.pathname = parsed.pathname.replace(/\/\/+/g, '/');
+            return parsed.toString();
+        } catch (e) {
+            // For relative URLs
+            return result.replace(/([^:])\/\/+/g, '$1/');
+        }
     }
 
     // ==================== Fetch Interceptor ====================
@@ -599,8 +667,17 @@
             return Promise.resolve(createBitrateTestResponse(url));
         }
 
-        // Full adaptation: route translation + optional prefix
-        const newUrl = adaptUrlForEmby(url);
+        // Full adaptation: route translation + optional prefix + double-slash fix
+        let newUrl = adaptUrlForEmby(url);
+
+        // Sanitize URL to prevent any remaining double slashes
+        newUrl = sanitizeUrl(newUrl);
+
+        // For PlaybackInfo GET requests, ensure UserId is in query params (Bug 4 fix)
+        const method = (options.method || 'GET').toUpperCase();
+        if (isPlaybackInfoRequest(newUrl) && method === 'GET') {
+            newUrl = ensurePlaybackInfoUserId(newUrl);
+        }
 
         // Transform headers
         const newHeaders = transformHeaders(options.headers);
@@ -681,6 +758,14 @@
             }
 
             adaptedUrl = adaptUrlForEmby(String(url));
+            // Sanitize URL to prevent any remaining double slashes
+            adaptedUrl = sanitizeUrl(adaptedUrl);
+
+            // For PlaybackInfo GET requests, ensure UserId is in query params (Bug 4 fix)
+            if (isPlaybackInfoRequest(adaptedUrl) && method.toUpperCase() === 'GET') {
+                adaptedUrl = ensurePlaybackInfoUserId(adaptedUrl);
+            }
+
             this._embyAdapted = true;
             this._embyIsPlaybackInfo = isPlaybackInfoRequest(adaptedUrl);
             log('XHR Intercepting:', url, '->', adaptedUrl);
@@ -906,7 +991,7 @@
         },
 
         getAccessToken: function() { return embyAccessToken; },
-        getUserId: function() { return embyUserId; },
+        getUserId: function() { return getUserId(); },
 
         setEnabled: function(enabled) {
             adapterEnabled = enabled;
