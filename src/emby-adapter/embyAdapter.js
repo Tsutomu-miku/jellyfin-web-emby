@@ -18,12 +18,12 @@
     // Configuration
     // ========================================
 
-    const ADAPTER_VERSION = '1.2.0';
+    const ADAPTER_VERSION = '1.3.0';
     let DEBUG = localStorage.getItem('embyAdapterDebug') === 'true';
 
     const SPOOFED_JELLYFIN_VERSION = '10.10.7';
 
-    // Paths whose responses need version spoofing (will be matched case-insensitively)
+    // Paths whose responses need version spoofing (matched case-insensitively)
     const VERSION_SPOOF_PATHS = [
         '/system/info/public',
         '/system/info',
@@ -58,28 +58,65 @@
     }
 
     // ========================================
-    // URL Transformation
+    // Cross-origin detection
     // ========================================
 
     /**
-     * Check whether a URL targets the configured Emby server.
+     * Check if a URL is cross-origin (different host/port from current page).
+     * ALL cross-origin API requests need header cleanup for CORS safety.
      */
-    function isEmbyApiUrl(url) {
-        const serverUrl = getEmbyServerUrl();
-        if (!serverUrl || !url) return false;
+    function isCrossOrigin(url) {
+        if (!url) return false;
         try {
             const u = new URL(url, window.location.origin);
-            const s = new URL(serverUrl);
-            return u.hostname === s.hostname && u.port === s.port;
+            return u.origin !== window.location.origin;
         } catch { return false; }
     }
 
     /**
+     * Check whether a URL targets the configured Emby server.
+     * Falls back to detecting any cross-origin request with Emby/Jellyfin API patterns.
+     */
+    function isEmbyApiUrl(url) {
+        if (!url) return false;
+        try {
+            const u = new URL(url, window.location.origin);
+
+            // Method 1: match configured server
+            const serverUrl = getEmbyServerUrl();
+            if (serverUrl) {
+                const s = new URL(serverUrl);
+                if (u.hostname === s.hostname && u.port === s.port) return true;
+            }
+
+            // Method 2: for cross-origin requests, check if path looks like a Jellyfin/Emby API
+            // This catches requests BEFORE the server is configured (e.g. ConnectionManager auto-connect)
+            if (isCrossOrigin(url)) {
+                const lp = u.pathname.toLowerCase();
+                if (lp.startsWith('/emby/') || lp.startsWith('/emby')) return true;
+                // Common Jellyfin API paths
+                const apiPatterns = [
+                    '/system/info', '/users/', '/items', '/sessions',
+                    '/library/', '/branding/', '/displaypreferences',
+                    '/playbackinfo', '/livestreams', '/quickconnect',
+                    '/mediasources', '/audio/', '/videos/',
+                ];
+                for (const p of apiPatterns) {
+                    if (lp.includes(p)) return true;
+                }
+            }
+        } catch { /* ignore */ }
+        return false;
+    }
+
+    // ========================================
+    // URL Transformation
+    // ========================================
+
+    /**
      * Ensure the URL path is prefixed with /emby/ when talking to the Emby server.
-     * Jellyfin Web sends e.g. /System/Info/Public but Emby expects /emby/System/Info/Public.
      */
     function ensureEmbyPrefix(url) {
-        if (!isEmbyApiUrl(url)) return url;
         try {
             const u = new URL(url, window.location.origin);
             if (!u.pathname.toLowerCase().startsWith('/emby/') && !u.pathname.toLowerCase().startsWith('/emby')) {
@@ -106,13 +143,11 @@
 
             for (const path of VERSION_SPOOF_PATHS) {
                 const lowerPath = path.toLowerCase();
-                // Match both /system/info/public and /emby/system/info/public
                 if (pathname.endsWith(lowerPath) || pathname.endsWith('/emby' + lowerPath)) {
                     return true;
                 }
             }
 
-            // Exact match for /system/info (but NOT /system/info/public which is handled above)
             if (pathname.endsWith('/system/info') || pathname.endsWith('/emby/system/info')) {
                 return true;
             }
@@ -129,12 +164,12 @@
         try {
             const data = JSON.parse(bodyText);
             if (data && typeof data === 'object') {
+                const origVersion = data.Version;
                 data.Version = SPOOFED_JELLYFIN_VERSION;
-                // Also ensure ProductName looks right
                 if (!data.ProductName) {
                     data.ProductName = 'Jellyfin Server';
                 }
-                log('Spoofed Version to', SPOOFED_JELLYFIN_VERSION, '(was', data.Version, ')');
+                log('Spoofed Version to', SPOOFED_JELLYFIN_VERSION, '(was', origVersion, ')');
                 return JSON.stringify(data);
             }
         } catch (e) {
@@ -149,13 +184,10 @@
 
     /**
      * Build a proper Emby authorization header value.
-     * Uses ONLY the standard "Authorization" header to avoid CORS preflight
-     * issues with custom X-Emby-* headers.
      */
     function buildEmbyAuthHeaderValue(originalValue) {
         if (!originalValue) return originalValue;
 
-        // Replace "MediaBrowser" or "Jellyfin" scheme with "Emby"
         let value = originalValue;
         if (value.startsWith('MediaBrowser ')) {
             value = 'Emby ' + value.substring('MediaBrowser '.length);
@@ -163,7 +195,6 @@
             value = 'Emby ' + value.substring('Jellyfin '.length);
         }
 
-        // Inject token if present and not already in the value
         const token = getEmbyToken();
         if (token && !value.includes('Token=')) {
             value = value.replace(/\s*$/, '') + ', Token="' + token + '"';
@@ -173,24 +204,30 @@
     }
 
     /**
-     * Transform headers: keep only standard headers, convert auth to Emby format.
-     * Strips X-Emby-*, X-MediaBrowser-* to prevent CORS issues.
+     * Check if a header name is a non-standard Emby/Jellyfin header that
+     * would trigger CORS preflight failures.
+     */
+    function isProblematicHeader(name) {
+        const lk = name.toLowerCase();
+        return lk.startsWith('x-emby-') || lk.startsWith('x-mediabrowser-');
+    }
+
+    /**
+     * Transform headers for CORS safety.
+     * Strips X-Emby-*, X-MediaBrowser-* and converts auth to standard Authorization.
      */
     function transformHeaders(headers) {
         if (!headers) return headers;
 
-        let h;
         if (headers instanceof Headers) {
-            h = new Headers();
+            const h = new Headers();
             for (const [key, value] of headers.entries()) {
                 const lk = key.toLowerCase();
-                // Strip non-standard Emby/Jellyfin headers
-                if (lk.startsWith('x-emby-') || lk.startsWith('x-mediabrowser-')) {
-                    // If this is the auth header, fold it into Authorization
+                if (isProblematicHeader(key)) {
                     if (lk === 'x-emby-authorization' || lk === 'x-mediabrowser-token') {
                         h.set('Authorization', buildEmbyAuthHeaderValue(value));
                     }
-                    continue;
+                    continue; // drop it
                 }
                 if (lk === 'authorization') {
                     h.set('Authorization', buildEmbyAuthHeaderValue(value));
@@ -201,11 +238,11 @@
             return h;
         }
 
-        if (typeof headers === 'object') {
+        if (typeof headers === 'object' && !Array.isArray(headers)) {
             const result = {};
             for (const [key, value] of Object.entries(headers)) {
                 const lk = key.toLowerCase();
-                if (lk.startsWith('x-emby-') || lk.startsWith('x-mediabrowser-')) {
+                if (isProblematicHeader(key)) {
                     if (lk === 'x-emby-authorization' || lk === 'x-mediabrowser-token') {
                         result['Authorization'] = buildEmbyAuthHeaderValue(value);
                     }
@@ -301,9 +338,8 @@
             const path = urlObj.pathname;
             const lowerPath = path.toLowerCase();
 
-            // Strip /emby prefix to get the canonical API path
             if (lowerPath.startsWith('/emby/')) {
-                return path.substring(5); // keeps the leading /
+                return path.substring(5);
             }
             if (lowerPath.startsWith('/emby')) {
                 return path.substring(4) || '/';
@@ -326,22 +362,31 @@
         let modifiedInit = init ? { ...init } : {};
 
         try {
-            if (isEmbyApiUrl(url)) {
-                // Add /emby/ prefix
-                url = ensureEmbyPrefix(url);
-                log('Fetch intercepted:', url);
-
-                // Transform headers
+            // For ANY cross-origin request, clean up problematic headers
+            if (isCrossOrigin(url)) {
                 if (modifiedInit.headers) {
                     modifiedInit.headers = transformHeaders(modifiedInit.headers);
                 }
+                // If input is a Request object, we need to rebuild it with clean headers
+                if (input instanceof Request) {
+                    const cleanHeaders = transformHeaders(new Headers(input.headers));
+                    // Merge: init headers take precedence over request headers
+                    if (!modifiedInit.headers) {
+                        modifiedInit.headers = cleanHeaders;
+                    }
+                }
+            }
 
-                // Reconstruct input
+            // For Emby API requests specifically, also add /emby/ prefix and do response transforms
+            if (isEmbyApiUrl(url)) {
+                url = ensureEmbyPrefix(url);
+                log('Fetch intercepted:', url);
+
+                // Reconstruct input with new URL
                 if (typeof input === 'string') {
                     input = url;
                 } else if (input instanceof Request) {
                     input = new Request(url, input);
-                    // Headers from init take precedence
                 }
 
                 // Make the request
@@ -378,12 +423,11 @@
             warn('Fetch intercept error:', error);
         }
 
-        return originalFetch.call(this, input, init);
+        return originalFetch.call(this, input, modifiedInit);
     };
 
     async function transformResponseByPath(response, apiPath) {
         const lowerPath = apiPath.toLowerCase();
-        // Skip system/info — already handled by version spoofing
         if (lowerPath.includes('/system/info')) return response;
 
         const cloned = response.clone();
@@ -419,23 +463,27 @@
 
     XMLHttpRequest.prototype.open = function (method, url, ...rest) {
         this._embyOrigUrl = url;
-        if (isEmbyApiUrl(url)) {
+        this._isCrossOrigin = isCrossOrigin(url);
+        this._isEmbyApi = isEmbyApiUrl(url);
+
+        if (this._isEmbyApi) {
             url = ensureEmbyPrefix(url);
-            this._embyIntercepted = true;
             log('XHR intercepted:', method, url);
         }
         return originalXHROpen.call(this, method, url, ...rest);
     };
 
     XMLHttpRequest.prototype.setRequestHeader = function (name, value) {
-        if (this._embyIntercepted) {
+        // For ALL cross-origin requests, strip problematic headers
+        if (this._isCrossOrigin || this._isEmbyApi) {
             const lk = name.toLowerCase();
-            // Strip custom headers that cause CORS issues
-            if (lk.startsWith('x-emby-') || lk.startsWith('x-mediabrowser-')) {
+            if (isProblematicHeader(name)) {
                 if (lk === 'x-emby-authorization') {
+                    // Fold into standard Authorization header
                     return originalXHRSetHeader.call(this, 'Authorization', buildEmbyAuthHeaderValue(value));
                 }
-                return; // drop the header
+                log('Stripped header:', name);
+                return; // drop the header entirely
             }
             if (lk === 'authorization') {
                 return originalXHRSetHeader.call(this, 'Authorization', buildEmbyAuthHeaderValue(value));
@@ -445,8 +493,7 @@
     };
 
     XMLHttpRequest.prototype.send = function (...args) {
-        // For version spoofing in XHR we override responseText via getter
-        if (this._embyIntercepted && needsVersionSpoof(this._embyOrigUrl)) {
+        if (this._isEmbyApi && needsVersionSpoof(this._embyOrigUrl)) {
             this.addEventListener('readystatechange', function () {
                 if (this.readyState === 4 && this.status === 200) {
                     try {
@@ -550,10 +597,7 @@
             const data = await resp.json();
             const token = data.AccessToken;
 
-            // Save config
             this.configure(serverUrl, token);
-
-            // Sync to Jellyfin credentials format
             syncToJellyfinCredentials(serverUrl, data);
 
             return data;
@@ -569,10 +613,6 @@
         return id;
     }
 
-    /**
-     * Sync authentication data to Jellyfin's credential format so the
-     * ConnectionManager picks it up after page reload.
-     */
     function syncToJellyfinCredentials(serverUrl, authData) {
         try {
             const serverId = authData.ServerId || authData.SessionInfo?.ServerId || '';
