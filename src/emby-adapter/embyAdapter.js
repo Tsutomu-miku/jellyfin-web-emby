@@ -1,15 +1,17 @@
 /**
- * Emby API Adapter for Jellyfin Web v1.3.0
+ * Emby API Adapter for Jellyfin Web v1.4.0
  * 
  * Based on the stable ce25248 version, with targeted fixes:
  * 1. config.json interception: tells ConnectionManager the real Emby server URL
  * 2. Version spoofing: replaces Emby 4.x version with 10.10.7
  * 3. Auto-detect /emby/ prefix: some Emby servers need it, some don't
+ * 4. API route translation: rewrites Jellyfin-only API paths to Emby-compatible format
  * 
  * Key differences handled:
  * 1. URL prefix: Some Emby servers require /emby/ prefix, auto-detected
  * 2. Auth header: Uses "Emby" scheme in standard Authorization header
  * 3. Token passing: Embedded in Authorization header value
+ * 4. API routes: Jellyfin SDK uses new flat routes; Emby requires /Users/{userId}/... format
  */
 
 (function() {
@@ -17,7 +19,7 @@
 
     // ==================== Configuration ====================
 
-    const ADAPTER_VERSION = '1.3.0';
+    const ADAPTER_VERSION = '1.4.0';
     const STORAGE_KEY = 'emby_adapter_config';
     const EMBY_TOKEN_KEY = 'emby_access_token';
     const EMBY_USER_KEY = 'emby_user_id';
@@ -137,8 +139,6 @@
 
     /**
      * Conditionally add /emby/ prefix based on auto-detection result.
-     * If needsEmbyPrefix is false or null, don't add it.
-     * If the URL already has /emby/ prefix, leave it alone.
      */
     function maybeAddEmbyPrefix(url) {
         if (!needsEmbyPrefix) return url; // false or null => don't add
@@ -157,6 +157,173 @@
             return url;
         }
     }
+
+    // ==================== API Route Translation ====================
+    // Jellyfin SDK generates new-style flat routes; Emby 4.x only supports
+    // the old /Users/{userId}/... format. We must rewrite them.
+
+    /**
+     * Translate Jellyfin-only API paths to Emby-compatible paths.
+     * Returns the modified full URL string if translation was needed, or null.
+     */
+    function translateJellyfinToEmbyUrl(url) {
+        try {
+            const parsed = new URL(url);
+            const pathname = parsed.pathname;
+            const params = parsed.searchParams;
+
+            // Get userId from query params or from stored state
+            const userId = params.get('userId') || embyUserId;
+            if (!userId) return null; // can't translate without userId
+
+            let newPathname = null;
+            let removeUserId = false; // whether to remove userId from query params
+
+            // --- Category 1: UserViews ---
+            // GET /UserViews?userId=xxx -> /Users/{userId}/Views
+            if (/^\/UserViews$/i.test(pathname)) {
+                newPathname = '/Users/' + userId + '/Views';
+                removeUserId = true;
+            }
+            // GET /UserViews/GroupingOptions?userId=xxx -> /Users/{userId}/GroupingOptions
+            else if (/^\/UserViews\/GroupingOptions$/i.test(pathname)) {
+                newPathname = '/Users/' + userId + '/GroupingOptions';
+                removeUserId = true;
+            }
+
+            // --- Category 2: Items ---
+            // GET /Items?userId=xxx -> /Users/{userId}/Items
+            else if (/^\/Items$/i.test(pathname)) {
+                newPathname = '/Users/' + userId + '/Items';
+                removeUserId = true;
+            }
+            // GET /Items/Suggestions?userId=xxx -> /Users/{userId}/Suggestions
+            else if (/^\/Items\/Suggestions$/i.test(pathname)) {
+                newPathname = '/Users/' + userId + '/Suggestions';
+                removeUserId = true;
+            }
+            // GET /Items/Root?userId=xxx -> /Users/{userId}/Items/Root
+            else if (/^\/Items\/Root$/i.test(pathname)) {
+                newPathname = '/Users/' + userId + '/Items/Root';
+                removeUserId = true;
+            }
+            // GET /Items/Latest?userId=xxx -> /Users/{userId}/Items/Latest
+            else if (/^\/Items\/Latest$/i.test(pathname)) {
+                newPathname = '/Users/' + userId + '/Items/Latest';
+                removeUserId = true;
+            }
+            // GET /Items/{itemId}?userId=xxx -> /Users/{userId}/Items/{itemId}
+            // Also handles /Items/{itemId}/Intros, /Items/{itemId}/LocalTrailers, /Items/{itemId}/SpecialFeatures
+            else if (/^\/Items\/([a-f0-9]+)(\/(?:Intros|LocalTrailers|SpecialFeatures))?$/i.test(pathname)) {
+                const match = pathname.match(/^\/Items\/([a-f0-9]+)(\/(?:Intros|LocalTrailers|SpecialFeatures))?$/i);
+                if (match) {
+                    const itemId = match[1];
+                    const suffix = match[2] || '';
+                    newPathname = '/Users/' + userId + '/Items/' + itemId + suffix;
+                    removeUserId = true;
+                }
+            }
+
+            // --- Category 3: UserItems ---
+            // GET /UserItems/Resume?userId=xxx -> /Users/{userId}/Items/Resume
+            else if (/^\/UserItems\/Resume$/i.test(pathname)) {
+                newPathname = '/Users/' + userId + '/Items/Resume';
+                removeUserId = true;
+            }
+            // GET/POST /UserItems/{itemId}/UserData?userId=xxx -> /Users/{userId}/Items/{itemId}/UserData
+            else if (/^\/UserItems\/([a-f0-9]+)\/UserData$/i.test(pathname)) {
+                const match = pathname.match(/^\/UserItems\/([a-f0-9]+)\/UserData$/i);
+                if (match) {
+                    newPathname = '/Users/' + userId + '/Items/' + match[1] + '/UserData';
+                    removeUserId = true;
+                }
+            }
+            // POST /UserItems/{itemId}/Rating?userId=xxx -> /Users/{userId}/Items/{itemId}/Rating
+            // DELETE /UserItems/{itemId}/Rating?userId=xxx -> /Users/{userId}/Items/{itemId}/Rating
+            else if (/^\/UserItems\/([a-f0-9]+)\/Rating$/i.test(pathname)) {
+                const match = pathname.match(/^\/UserItems\/([a-f0-9]+)\/Rating$/i);
+                if (match) {
+                    newPathname = '/Users/' + userId + '/Items/' + match[1] + '/Rating';
+                    removeUserId = true;
+                }
+            }
+
+            // --- Category 4: UserFavoriteItems ---
+            // POST/DELETE /UserFavoriteItems/{itemId}?userId=xxx -> /Users/{userId}/FavoriteItems/{itemId}
+            else if (/^\/UserFavoriteItems\/([a-f0-9]+)$/i.test(pathname)) {
+                const match = pathname.match(/^\/UserFavoriteItems\/([a-f0-9]+)$/i);
+                if (match) {
+                    newPathname = '/Users/' + userId + '/FavoriteItems/' + match[1];
+                    removeUserId = true;
+                }
+            }
+
+            // --- Category 5: UserPlayedItems ---
+            // POST/DELETE /UserPlayedItems/{itemId}?userId=xxx -> /Users/{userId}/PlayedItems/{itemId}
+            else if (/^\/UserPlayedItems\/([a-f0-9]+)$/i.test(pathname)) {
+                const match = pathname.match(/^\/UserPlayedItems\/([a-f0-9]+)$/i);
+                if (match) {
+                    newPathname = '/Users/' + userId + '/PlayedItems/' + match[1];
+                    removeUserId = true;
+                }
+            }
+
+            // --- Category 6: PlayingItems (session-based, no userId in path) ---
+            // POST /PlayingItems/{itemId} -> /Users/{userId}/PlayingItems/{itemId}
+            // POST /PlayingItems/{itemId}/Progress -> /Users/{userId}/PlayingItems/{itemId}/Progress
+            // DELETE /PlayingItems/{itemId} -> /Users/{userId}/PlayingItems/{itemId}
+            else if (/^\/PlayingItems\/([a-f0-9]+)(\/Progress)?$/i.test(pathname)) {
+                const match = pathname.match(/^\/PlayingItems\/([a-f0-9]+)(\/Progress)?$/i);
+                if (match) {
+                    const itemId = match[1];
+                    const suffix = match[2] || '';
+                    newPathname = '/Users/' + userId + '/PlayingItems/' + itemId + suffix;
+                }
+            }
+
+            // --- Category 7: UserImage ---
+            // GET/POST/DELETE /UserImage?userId=xxx -> /Users/{userId}/Images/{imageType}
+            else if (/^\/UserImage$/i.test(pathname)) {
+                const imageType = params.get('imageType') || 'Primary';
+                const imageIndex = params.get('imageIndex');
+                if (imageIndex != null) {
+                    newPathname = '/Users/' + userId + '/Images/' + imageType + '/' + imageIndex;
+                } else {
+                    newPathname = '/Users/' + userId + '/Images/' + imageType;
+                }
+                removeUserId = true;
+                params.delete('imageType');
+                params.delete('imageIndex');
+            }
+
+            // --- Category 8: User Management ---
+            // POST /Users/Password?userId=xxx -> /Users/{userId}/Password
+            else if (/^\/Users\/Password$/i.test(pathname)) {
+                newPathname = '/Users/' + userId + '/Password';
+                removeUserId = true;
+            }
+            // POST /Users/Configuration?userId=xxx -> /Users/{userId}/Configuration
+            else if (/^\/Users\/Configuration$/i.test(pathname)) {
+                newPathname = '/Users/' + userId + '/Configuration';
+                removeUserId = true;
+            }
+
+            if (newPathname) {
+                parsed.pathname = newPathname;
+                if (removeUserId) {
+                    parsed.searchParams.delete('userId');
+                }
+                log('Route translated:', pathname, '->', newPathname);
+                return parsed.toString();
+            }
+
+        } catch (e) {
+            warn('Route translation error:', e);
+        }
+        return null;
+    }
+
+    // ==================== Auth Header Helpers ====================
 
     /**
      * Build the Emby auth header value.
@@ -296,6 +463,24 @@
         });
     }
 
+    // ==================== Core URL Adaptation ====================
+
+    /**
+     * Full URL adaptation pipeline for Emby compatibility:
+     * 1. Translate Jellyfin-only routes to Emby format
+     * 2. Conditionally add /emby/ prefix
+     */
+    function adaptUrlForEmby(url) {
+        // Step 1: Translate Jellyfin SDK routes to Emby-compatible routes
+        const translated = translateJellyfinToEmbyUrl(url);
+        let result = translated || url;
+
+        // Step 2: Conditionally add /emby/ prefix
+        result = maybeAddEmbyPrefix(result);
+
+        return result;
+    }
+
     // ==================== Fetch Interceptor ====================
 
     const originalFetch = window.fetch;
@@ -347,8 +532,8 @@
 
         log('Intercepting fetch:', url);
 
-        // Conditionally add /emby/ prefix (only if server needs it)
-        const newUrl = maybeAddEmbyPrefix(url);
+        // Full adaptation: route translation + optional prefix
+        const newUrl = adaptUrlForEmby(url);
 
         // Transform headers
         const newHeaders = transformHeaders(options.headers);
@@ -400,7 +585,7 @@
         }
 
         if (adapterEnabled && isEmbyApiRequest(String(url))) {
-            adaptedUrl = maybeAddEmbyPrefix(String(url));
+            adaptedUrl = adaptUrlForEmby(String(url));
             this._embyAdapted = true;
             log('XHR Intercepting:', url, '->', adaptedUrl);
         }
