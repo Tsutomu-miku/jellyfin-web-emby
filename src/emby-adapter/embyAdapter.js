@@ -23,6 +23,8 @@
  * 19. Rewrite DirectStreamUrl: /Videos/ path blocked by Cloudflare WAF, use /Audio/ workaround (v1.8.0)
  * 20. Re-enable DirectPlay/DirectStream: server has transcoding disabled, must use direct paths (v1.8.0)
  * 21. Include MKV in DirectPlayProfiles: Chrome can play MKV h264 natively despite canPlayType lying (v1.8.0)
+ * 22. Fix auth: use Emby Web client name, X-Emby-Authorization header, retry without auth on 401 (v1.8.1)
+ * 23. Fix testConnection: use Accept instead of Content-Type on GET requests (v1.8.1)
  */
 
 (function() {
@@ -30,7 +32,7 @@
 
     // ==================== Configuration ====================
 
-    const ADAPTER_VERSION = '1.8.0';
+    const ADAPTER_VERSION = '1.8.1';
     const STORAGE_KEY = 'emby_adapter_config';
     const EMBY_TOKEN_KEY = 'emby_access_token';
     const EMBY_USER_KEY = 'emby_user_id';
@@ -733,8 +735,8 @@
 
         // Use MediaBrowser prefix (accepted by Emby servers)
         // Keep Client/Device/Version consistent with what Jellyfin Web sent during login
-        let value = 'MediaBrowser Client="Jellyfin Web", Device="' + browser +
-                   '", DeviceId="' + deviceId + '", Version="10.10.7"';
+        let value = 'MediaBrowser Client="Emby Web", Device="' + browser +
+                   '", DeviceId="' + deviceId + '", Version="4.8.8.0"';
 
         if (token) {
             value += ', Token="' + token + '"';
@@ -1337,7 +1339,7 @@
             try {
                 let resp = await originalFetch(url, {
                     method: 'GET',
-                    headers: { 'Content-Type': 'application/json' }
+                    headers: { 'Accept': 'application/json' }
                 });
                 if (resp.ok) {
                     const data = await resp.json();
@@ -1354,7 +1356,7 @@
             try {
                 let resp = await originalFetch(url, {
                     method: 'GET',
-                    headers: { 'Content-Type': 'application/json' }
+                    headers: { 'Accept': 'application/json' }
                 });
                 if (resp.ok) {
                     const data = await resp.json();
@@ -1378,16 +1380,49 @@
             const authValue = buildEmbyAuthHeaderValue(null);
 
             try {
+                // v1.8.1: Use X-Emby-Authorization instead of Authorization header.
+                // Some Emby servers behind Cloudflare reject Authorization header
+                // due to CORS preflight handling. X-Emby-Authorization is the
+                // native Emby auth header and may be handled differently.
+                // Also try without auth header first (Emby allows AuthenticateByName
+                // with just the client info in the body).
                 const resp = await originalFetch(url, {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
-                        'Authorization': authValue
+                        'X-Emby-Authorization': authValue
                     },
                     body: JSON.stringify({ Username: username, Pw: password })
                 });
 
                 if (!resp.ok) {
+                    // v1.8.1: If 401 with X-Emby-Authorization, retry without auth header
+                    if (resp.status === 401) {
+                        log('Auth with X-Emby-Authorization returned 401, retrying without auth header');
+                        const retryResp = await originalFetch(url, {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json'
+                            },
+                            body: JSON.stringify({ Username: username, Pw: password })
+                        });
+                        if (retryResp.ok) {
+                            const retryData = await retryResp.json();
+                            embyAccessToken = retryData.AccessToken;
+                            embyUserId = retryData.User.Id;
+                            embyServerUrl = baseUrl;
+                            localStorage.setItem(EMBY_TOKEN_KEY, embyAccessToken);
+                            localStorage.setItem(EMBY_USER_KEY, embyUserId);
+                            localStorage.setItem(EMBY_SERVER_KEY, embyServerUrl);
+                            return {
+                                success: true,
+                                accessToken: retryData.AccessToken,
+                                userId: retryData.User.Id,
+                                userName: retryData.User.Name,
+                                serverId: retryData.ServerId
+                            };
+                        }
+                    }
                     const errorText = await resp.text();
                     return { success: false, error: 'Authentication failed: HTTP ' + resp.status, details: errorText };
                 }
@@ -1405,7 +1440,7 @@
                     accessToken: data.AccessToken,
                     userId: data.User.Id,
                     userName: data.User.Name,
-                    serverId: data.ServerId
+serverId: data.ServerId
                 };
             } catch (e) {
                 return { success: false, error: e.message };
