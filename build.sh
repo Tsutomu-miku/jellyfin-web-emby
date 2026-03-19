@@ -230,10 +230,9 @@ fi
 # Copy build output to dist
 cp -r "${DIST_SRC}"/* "${DIST_DIR}/"
 
-# Also copy adapter files to dist as fallback (in case webpack didn't bundle them)
-echo "  Copying standalone adapter files to dist as fallback..."
-cp "${SRC_DIR}/emby-adapter/embyAdapter.js" "${DIST_DIR}/embyAdapter.js"
-cp "${SRC_DIR}/emby-adapter/index.js" "${DIST_DIR}/embySetup.js"
+# NOTE: embyAdapter.js and index.js are bundled by webpack (Phase 1).
+# Do NOT copy raw source files to dist/ — they use ES module syntax (import/export)
+# which causes SyntaxError when loaded via plain <script> tags.
 
 # ========================================
 # CRITICAL: Copy Service Worker to dist root
@@ -244,13 +243,10 @@ cp "${SRC_DIR}/emby-adapter/index.js" "${DIST_DIR}/embySetup.js"
 echo "  Copying Service Worker (sw.js) to dist root..."
 cp "${SRC_DIR}/emby-adapter/sw.js" "${DIST_DIR}/sw.js"
 
-# Inject script tags into index.html if adapter wasn't bundled
-if [ -f "${DIST_DIR}/index.html" ]; then
-    if ! grep -q "embyAdapter" "${DIST_DIR}/index.html"; then
-        echo "  Injecting adapter script tags into index.html..."
-        sed -i 's|</head>|<script src="embyAdapter.js"></script>\n<script src="embySetup.js"></script>\n</head>|' "${DIST_DIR}/index.html"
-    fi
-fi
+# NOTE: Script tag injection removed in v1.7.0.
+# The adapter is bundled by webpack and included in the main bundle.
+# Injecting raw <script> tags caused double-loading and SyntaxError
+# (ES module export/import keywords are invalid in classic script mode).
 
 cd "${SCRIPT_DIR}"
 
