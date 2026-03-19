@@ -1,5 +1,5 @@
 /**
- * Emby API Adapter for Jellyfin Web v1.6.3
+ * Emby API Adapter for Jellyfin Web v1.6.4
  * 
  * Based on the stable ce25248 version, with targeted fixes:
  * 1. config.json interception: tells ConnectionManager the real Emby server URL
@@ -16,6 +16,7 @@
  * 12. Correct auth header format: uses MediaBrowser prefix and official client parameters (v1.6.1)
  * 13. CORS preflight fix: skip auth headers & User-Agent on public endpoints to avoid preflight (v1.6.2)
  * 14. Auth header fix: preserve original DeviceId/Device from Jellyfin Web to maintain session (v1.6.3)
+ * 15. Remove X-Emby-Authorization header injection to prevent CORS preflight failures (v1.6.4)
  */
 
 (function() {
@@ -23,7 +24,7 @@
 
     // ==================== Configuration ====================
 
-    const ADAPTER_VERSION = '1.6.3';
+    const ADAPTER_VERSION = '1.6.4';
     const STORAGE_KEY = 'emby_adapter_config';
     const EMBY_TOKEN_KEY = 'emby_access_token';
     const EMBY_USER_KEY = 'emby_user_id';
@@ -616,8 +617,6 @@
                 newHeaders.set('Authorization', authValue);
             } else if (embyAccessToken) {
                 newHeaders.set('Authorization', buildEmbyAuthHeaderValue(embyAccessToken));
-                // Also add X-Emby-Authorization header for compatibility
-                newHeaders.set('X-Emby-Authorization', buildEmbyAuthHeaderValue(embyAccessToken));
             }
         }
         return newHeaders;
@@ -949,8 +948,6 @@
             if (!isPublic && embyAccessToken && !this._embyHeaders['Authorization']) {
                 const authValue = buildEmbyAuthHeaderValue(embyAccessToken);
                 XHRSetHeader.call(this, 'Authorization', authValue);
-                // Also add X-Emby-Authorization header for compatibility
-                XHRSetHeader.call(this, 'X-Emby-Authorization', authValue);
             }
 
             if (needsVersionSpoof(this._embyOriginalUrl)) {
