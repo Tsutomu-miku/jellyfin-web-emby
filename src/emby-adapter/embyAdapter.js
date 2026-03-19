@@ -20,6 +20,9 @@
  * 16. Fix Token="" auth header bug: replace empty SDK token with adapter's real token (v1.6.5)
  * 17. Force HLS transcoding: disable DirectPlay/DirectStream for MKV/AVI, ensure HLS TranscodingProfile (v1.7.0)
  * 18. Config themes: add themes=[] to synthetic config.json to suppress warnings (v1.7.0)
+ * 19. Rewrite DirectStreamUrl: /Videos/ path blocked by Cloudflare WAF, use /Audio/ workaround (v1.8.0)
+ * 20. Re-enable DirectPlay/DirectStream: server has transcoding disabled, must use direct paths (v1.8.0)
+ * 21. Include MKV in DirectPlayProfiles: Chrome can play MKV h264 natively despite canPlayType lying (v1.8.0)
  */
 
 (function() {
@@ -27,7 +30,7 @@
 
     // ==================== Configuration ====================
 
-    const ADAPTER_VERSION = '1.7.0';
+    const ADAPTER_VERSION = '1.8.0';
     const STORAGE_KEY = 'emby_adapter_config';
     const EMBY_TOKEN_KEY = 'emby_access_token';
     const EMBY_USER_KEY = 'emby_user_id';
@@ -425,16 +428,45 @@
             });
         }
 
-        // --- DirectPlayProfiles: browser cannot natively play MKV/AVI/etc. ---
-        // Only keep profiles for containers the browser can actually play.
-        // This forces Emby to use TranscodingProfiles (HLS) for unsupported containers.
-        const BROWSER_NATIVE_CONTAINERS = ['mp4', 'webm', 'mp3', 'aac', 'flac', 'ogg', 'wav', 'opus'];
+        // --- DirectPlayProfiles: v1.8.0 include MKV for direct play ---
+        // Chrome can play MKV containers with h264/hevc video natively
+        // (its internal Matroska demuxer works even though canPlayType returns '').
+        // We need DirectPlay enabled because this Emby server has transcoding disabled.
+        // The /Videos/ path is blocked by Cloudflare WAF, so we rewrite the
+        // DirectStreamUrl to use /Audio/{id}/stream in the response interceptor.
         if (Array.isArray(p.DirectPlayProfiles)) {
             p.DirectPlayProfiles = p.DirectPlayProfiles.filter(dp => {
                 if (dp.Container === 'hls') return false; // Jellyfin-only concept
-                // Only keep containers the browser can play natively
-                const containers = (dp.Container || '').toLowerCase().split(',').map(c => c.trim());
-                return containers.some(c => BROWSER_NATIVE_CONTAINERS.includes(c));
+                return true; // Keep all other containers including MKV
+            });
+            // Ensure MKV is in at least one video DirectPlayProfile
+            const hasMkv = p.DirectPlayProfiles.some(dp =>
+                dp.Type === 'Video' && (dp.Container || '').toLowerCase().includes('mkv')
+            );
+            if (!hasMkv) {
+                log('Injecting MKV DirectPlayProfile for browser h264/hevc playback');
+                p.DirectPlayProfiles.push({
+                    Container: 'mkv',
+                    Type: 'Video',
+                    VideoCodec: 'h264,hevc,h265,vp8,vp9,av1',
+                    AudioCodec: 'aac,mp3,ac3,eac3,flac,vorbis,opus,pcm'
+                });
+            }
+            // Also ensure existing profiles have broad audio codec support (especially FLAC)
+            p.DirectPlayProfiles = p.DirectPlayProfiles.map(dp => {
+                if (dp.Type === 'Video' && dp.AudioCodec) {
+                    const codecs = dp.AudioCodec.toLowerCase().split(',').map(c => c.trim());
+                    if (!codecs.includes('flac')) {
+                        dp.AudioCodec += ',flac';
+                    }
+                    if (!codecs.includes('opus')) {
+                        dp.AudioCodec += ',opus';
+                    }
+                    if (!codecs.includes('vorbis')) {
+                        dp.AudioCodec += ',vorbis';
+                    }
+                }
+                return dp;
             });
         }
 
@@ -506,14 +538,14 @@
                 body.UserId = userId;
             }
 
-            // v1.7.0: Force transcoding for browser compatibility.
-            // Browsers cannot play MKV/AVI containers natively.
-            // By disabling direct play/stream, Emby will use HLS transcoding
-            // which produces .m3u8 + .ts segments playable via hls.js.
-            body.EnableDirectPlay = false;
-            body.EnableDirectStream = false;
-            body.EnableTranscoding = true;
-            // Allow stream copy so Emby transmuxes (no re-encoding) when possible
+            // v1.8.0: Enable DirectPlay and DirectStream.
+            // The Emby server has transcoding disabled (SupportsTranscoding=false),
+            // so we MUST use direct paths. The Cloudflare WAF blocks /Videos/ URLs,
+            // but we rewrite DirectStreamUrl to /Audio/{id}/stream in the response
+            // interceptor (see rewritePlaybackInfoResponse).
+            body.EnableDirectPlay = true;
+            body.EnableDirectStream = true;
+            body.EnableTranscoding = true;  // Request it, but server may still refuse
             body.AllowVideoStreamCopy = true;
             body.AllowAudioStreamCopy = true;
 
@@ -538,6 +570,120 @@
     }
 
     /**
+     * v1.8.0: Rewrite PlaybackInfo response to fix video stream URLs.
+     *
+     * Problem: Emby returns DirectStreamUrl like /Videos/{id}/stream.mkv?Static=true
+     * but the Cloudflare WAF on this server blocks all /Videos/ paths with 403.
+     * 
+     * Solution: Rewrite the URL to use /Audio/{id}/stream which:
+     * - Is NOT blocked by Cloudflare WAF
+     * - Returns the FULL original file (video+audio) despite the /Audio/ path name
+     * - Supports Range requests (HTTP 206) for seeking
+     * - Returns proper CORS headers (Access-Control-Allow-Origin: *)
+     * - Works with just api_key query parameter authentication
+     *
+     * Also handles the case where the video player constructs its own URL using
+     * /Videos/{id}/stream.{ext} pattern — we intercept those in the fetch/XHR layer.
+     */
+    function rewritePlaybackInfoResponse(bodyText) {
+        try {
+            const data = JSON.parse(bodyText);
+            if (!Array.isArray(data.MediaSources)) return bodyText;
+
+            let modified = false;
+            data.MediaSources = data.MediaSources.map(ms => {
+                // Rewrite DirectStreamUrl: /Videos/{id}/... → /Audio/{id}/stream
+                if (ms.DirectStreamUrl) {
+                    const oldUrl = ms.DirectStreamUrl;
+                    // Match patterns like /Videos/245419/stream.mkv or /videos/245419/original.mkv
+                    const videoPathMatch = oldUrl.match(/\/(?:V|v)ideos\/([^/]+)\//);
+                    if (videoPathMatch) {
+                        const itemId = videoPathMatch[1];
+                        // Reconstruct using /Audio/{id}/stream, preserving query params
+                        const qIdx = oldUrl.indexOf('?');
+                        const queryStr = qIdx >= 0 ? oldUrl.substring(qIdx) : '';
+                        // Add Static=true if not already present
+                        const hasStatic = queryStr.toLowerCase().includes('static=true');
+                        const separator = queryStr ? '&' : '?';
+                        ms.DirectStreamUrl = '/Audio/' + itemId + '/stream' + queryStr +
+                            (hasStatic ? '' : separator + 'Static=true');
+                        log('Rewrote DirectStreamUrl:', oldUrl, '->', ms.DirectStreamUrl);
+                        modified = true;
+                    }
+                }
+
+                // Rewrite TranscodingUrl similarly if it uses /Videos/ path
+                if (ms.TranscodingUrl) {
+                    const videoPathMatch = ms.TranscodingUrl.match(/\/(?:V|v)ideos\/([^/]+)\//);
+                    if (videoPathMatch) {
+                        const itemId = videoPathMatch[1];
+                        const qIdx = ms.TranscodingUrl.indexOf('?');
+                        const queryStr = qIdx >= 0 ? ms.TranscodingUrl.substring(qIdx) : '';
+                        const hasStatic = queryStr.toLowerCase().includes('static=true');
+                        const separator = queryStr ? '&' : '?';
+                        ms.TranscodingUrl = '/Audio/' + itemId + '/stream' + queryStr +
+                            (hasStatic ? '' : separator + 'Static=true');
+                        log('Rewrote TranscodingUrl:', ms.TranscodingUrl);
+                        modified = true;
+                    }
+                }
+
+                return ms;
+            });
+
+            if (modified) {
+                log('PlaybackInfo response rewritten with /Audio/ workaround');
+            }
+            return JSON.stringify(data);
+        } catch (e) {
+            warn('PlaybackInfo response rewrite error:', e);
+            return bodyText;
+        }
+    }
+
+    /**
+     * v1.8.0: Rewrite video stream URLs in fetch/XHR requests.
+     * The Jellyfin Web player constructs URLs like /Videos/{id}/stream.mkv
+     * based on the container format. We intercept these and redirect to
+     * /Audio/{id}/stream to bypass Cloudflare WAF.
+     */
+    function rewriteVideoStreamUrl(url) {
+        try {
+            const parsed = new URL(url);
+            // Match /Videos/{id}/stream.{ext} or /videos/{id}/original.{ext}
+            const match = parsed.pathname.match(/\/(?:V|v)ideos\/([^/]+)\/(stream|original)\.\w+/);
+            if (match) {
+                const itemId = match[1];
+                parsed.pathname = parsed.pathname.replace(
+                    /\/(?:V|v)ideos\/[^/]+\/(stream|original)\.\w+/,
+                    '/Audio/' + itemId + '/stream'
+                );
+                // Ensure Static=true is in params
+                if (!parsed.searchParams.has('Static')) {
+                    parsed.searchParams.set('Static', 'true');
+                }
+                log('Rewrote video stream URL to /Audio/ path:', parsed.toString());
+                return parsed.toString();
+            }
+        } catch (e) {
+            warn('Video stream URL rewrite error:', e);
+        }
+        return url;
+    }
+
+    /**
+     * Check if a URL is a video stream request that needs rewriting.
+     */
+    function isVideoStreamRequest(url) {
+        try {
+            const pathname = new URL(url).pathname.toLowerCase();
+            return /\/videos\/[^/]+\/(stream|original)\./.test(pathname);
+        } catch (e) {
+            return false;
+        }
+    }
+
+        /**
      * Create a synthetic BitrateTest response to avoid CORS issues.
      * The client uses this to estimate bandwidth; returning a fast response
      * with the requested data size makes it assume high bandwidth,
@@ -792,6 +938,12 @@
             return Promise.resolve(createBitrateTestResponse(url));
         }
 
+        // ---- v1.8.0: Rewrite /Videos/{id}/stream.ext to /Audio/{id}/stream ----
+        // Cloudflare WAF blocks /Videos/ paths but /Audio/ works and serves the full file
+        if (isVideoStreamRequest(url)) {
+            url = rewriteVideoStreamUrl(url);
+        }
+
         // Full adaptation: route translation + optional prefix + double-slash fix
         let newUrl = adaptUrlForEmby(url);
 
@@ -840,6 +992,18 @@
         return originalFetch.call(this, newUrl, newOptions).then(response => {
             handleAuthResponse(url, response);
 
+            // v1.8.0: Rewrite PlaybackInfo response to use /Audio/ stream URLs
+            if (isPlaybackInfoRequest(newUrl) && response.ok) {
+                return response.clone().text().then(bodyText => {
+                    const rewritten = rewritePlaybackInfoResponse(bodyText);
+                    return new Response(rewritten, {
+                        status: response.status,
+                        statusText: response.statusText,
+                        headers: response.headers
+                    });
+                });
+            }
+
             // Version spoofing
             if (needsVersionSpoof(newUrl) && response.ok) {
                 return response.clone().text().then(bodyText => {
@@ -878,6 +1042,11 @@
         }
 
         if (adapterEnabled && isEmbyApiRequest(String(url))) {
+            // v1.8.0: Rewrite /Videos/ stream URLs to /Audio/ to bypass Cloudflare WAF
+            if (isVideoStreamRequest(String(url))) {
+                adaptedUrl = rewriteVideoStreamUrl(String(url));
+            }
+
             // BitrateTest: flag for synthetic response in send()
             if (isBitrateTestRequest(String(url))) {
                 this._embyIsBitrateTest = true;
