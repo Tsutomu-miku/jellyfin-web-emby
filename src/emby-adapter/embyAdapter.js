@@ -1,5 +1,5 @@
 /**
- * Emby API Adapter for Jellyfin Web v1.6.5
+ * Emby API Adapter for Jellyfin Web v1.7.0
  * 
  * Based on the stable ce25248 version, with targeted fixes:
  * 1. config.json interception: tells ConnectionManager the real Emby server URL
@@ -18,6 +18,8 @@
  * 14. Auth header fix: preserve original DeviceId/Device from Jellyfin Web to maintain session (v1.6.3)
  * 15. Remove X-Emby-Authorization header injection to prevent CORS preflight failures (v1.6.4)
  * 16. Fix Token="" auth header bug: replace empty SDK token with adapter's real token (v1.6.5)
+ * 17. Force HLS transcoding: disable DirectPlay/DirectStream for MKV/AVI, ensure HLS TranscodingProfile (v1.7.0)
+ * 18. Config themes: add themes=[] to synthetic config.json to suppress warnings (v1.7.0)
  */
 
 (function() {
@@ -25,7 +27,7 @@
 
     // ==================== Configuration ====================
 
-    const ADAPTER_VERSION = '1.6.5';
+    const ADAPTER_VERSION = '1.7.0';
     const STORAGE_KEY = 'emby_adapter_config';
     const EMBY_TOKEN_KEY = 'emby_access_token';
     const EMBY_USER_KEY = 'emby_user_id';
@@ -423,10 +425,51 @@
             });
         }
 
-        // --- DirectPlayProfiles: remove HLS direct play (Jellyfin-only concept) ---
+        // --- DirectPlayProfiles: browser cannot natively play MKV/AVI/etc. ---
+        // Only keep profiles for containers the browser can actually play.
+        // This forces Emby to use TranscodingProfiles (HLS) for unsupported containers.
+        const BROWSER_NATIVE_CONTAINERS = ['mp4', 'webm', 'mp3', 'aac', 'flac', 'ogg', 'wav', 'opus'];
         if (Array.isArray(p.DirectPlayProfiles)) {
             p.DirectPlayProfiles = p.DirectPlayProfiles.filter(dp => {
-                return dp.Container !== 'hls';
+                if (dp.Container === 'hls') return false; // Jellyfin-only concept
+                // Only keep containers the browser can play natively
+                const containers = (dp.Container || '').toLowerCase().split(',').map(c => c.trim());
+                return containers.some(c => BROWSER_NATIVE_CONTAINERS.includes(c));
+            });
+        }
+
+        // --- TranscodingProfiles: ensure HLS transcoding is available ---
+        // If no HLS video transcoding profile exists, inject one.
+        // This is critical for MKV/AVI/etc. files that can't be direct-played.
+        if (!Array.isArray(p.TranscodingProfiles)) {
+            p.TranscodingProfiles = [];
+        }
+        const hasHlsVideo = p.TranscodingProfiles.some(
+            tp => tp.Type === 'Video' && (tp.Protocol || '').toLowerCase() === 'hls'
+        );
+        if (!hasHlsVideo) {
+            log('Injecting HLS TranscodingProfile (no existing HLS video profile found)');
+            p.TranscodingProfiles.unshift({
+                Container: 'ts',
+                Type: 'Video',
+                VideoCodec: 'h264,hevc,h265',
+                AudioCodec: 'aac,mp3,ac3,eac3',
+                Protocol: 'hls',
+                Context: 'Streaming',
+                MaxAudioChannels: '6',
+                MinSegments: 1,
+                SegmentLength: 6,
+                BreakOnNonKeyFrames: false
+            });
+        } else {
+            // Ensure existing HLS profiles allow stream copy for performance
+            p.TranscodingProfiles = p.TranscodingProfiles.map(tp => {
+                if (tp.Type === 'Video' && (tp.Protocol || '').toLowerCase() === 'hls') {
+                    // Ensure the codec lists are broad enough
+                    if (!tp.VideoCodec) tp.VideoCodec = 'h264,hevc,h265';
+                    if (!tp.AudioCodec) tp.AudioCodec = 'aac,mp3,ac3,eac3';
+                }
+                return tp;
             });
         }
 
@@ -463,9 +506,19 @@
                 body.UserId = userId;
             }
 
+            // v1.7.0: Force transcoding for browser compatibility.
+            // Browsers cannot play MKV/AVI containers natively.
+            // By disabling direct play/stream, Emby will use HLS transcoding
+            // which produces .m3u8 + .ts segments playable via hls.js.
+            body.EnableDirectPlay = false;
+            body.EnableDirectStream = false;
+            body.EnableTranscoding = true;
+            // Allow stream copy so Emby transmuxes (no re-encoding) when possible
+            body.AllowVideoStreamCopy = true;
+            body.AllowAudioStreamCopy = true;
+
             // Strip Jellyfin-specific top-level fields
             delete body.AlwaysBurnInSubtitleWhenTranscoding;
-            delete body.EnableTranscoding;
             delete body.SecondarySubtitleStreamIndex;
             delete body.EnableMediaProbe;
             delete body.DirectPlayProtocols;
@@ -610,12 +663,6 @@
             }
         }
 
-        // NOTE: User-Agent is a forbidden header in browsers — setting it via
-        // fetch()/XHR has no effect on the actual request, but having it in the
-        // Headers object can cause some browsers to trigger a CORS preflight.
-        // Removed in v1.6.2 to fix CORS issues on public endpoints.
-        // (Previously: newHeaders.set('User-Agent', EMBY_OFFICIAL_UA);)
-
         // Accept and Accept-Language are CORS-safe headers — they never trigger preflight
         newHeaders.set('Accept', 'application/json, text/plain, */*');
         newHeaders.set('Accept-Language', 'zh-CN,zh;q=0.9,en;q=0.8');
@@ -662,6 +709,7 @@
         }
         config.menuLinks = [];
         config.multiserver = false;
+        config.themes = [];
 
         log('config.json intercepted, servers:', config.servers || '(none)');
         return new Response(JSON.stringify(config), {
@@ -884,8 +932,6 @@
                 return; // Skip auth header for public endpoints
             }
             if (lowerName === 'user-agent') {
-                // User-Agent is a forbidden header in browsers — setting it via JS
-                // has no effect but can trigger CORS preflight. Skip it. (v1.6.2)
                 return;
             }
         }
@@ -900,7 +946,8 @@
             const configData = JSON.stringify({
                 servers: embyServerUrl ? [embyServerUrl] : [],
                 menuLinks: [],
-                multiserver: false
+                multiserver: false,
+                themes: []
             });
             log('XHR config.json intercepted');
             setTimeout(function() {
@@ -949,11 +996,7 @@
                 body = transformPlaybackInfoBody(body);
             }
 
-            // v1.6.2: Do NOT set User-Agent — it is a forbidden header in browsers
-            // and setting it can trigger CORS preflight requests.
-
             // v1.6.5: Always ensure Authorization header has a valid token.
-            // The SDK may set Authorization with Token="" due to credential race condition.
             const isPublic = isPublicApiEndpoint(this._embyOriginalUrl);
             if (!isPublic && embyAccessToken) {
                 const currentAuth = this._embyHeaders['Authorization'] || '';
