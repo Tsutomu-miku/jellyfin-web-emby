@@ -1,5 +1,5 @@
 /**
- * Emby API Adapter for Jellyfin Web v1.6.4
+ * Emby API Adapter for Jellyfin Web v1.6.5
  * 
  * Based on the stable ce25248 version, with targeted fixes:
  * 1. config.json interception: tells ConnectionManager the real Emby server URL
@@ -17,6 +17,7 @@
  * 13. CORS preflight fix: skip auth headers & User-Agent on public endpoints to avoid preflight (v1.6.2)
  * 14. Auth header fix: preserve original DeviceId/Device from Jellyfin Web to maintain session (v1.6.3)
  * 15. Remove X-Emby-Authorization header injection to prevent CORS preflight failures (v1.6.4)
+ * 16. Fix Token="" auth header bug: replace empty SDK token with adapter's real token (v1.6.5)
  */
 
 (function() {
@@ -24,7 +25,7 @@
 
     // ==================== Configuration ====================
 
-    const ADAPTER_VERSION = '1.6.4';
+    const ADAPTER_VERSION = '1.6.5';
     const STORAGE_KEY = 'emby_adapter_config';
     const EMBY_TOKEN_KEY = 'emby_access_token';
     const EMBY_USER_KEY = 'emby_user_id';
@@ -451,14 +452,15 @@
         try {
             const body = JSON.parse(bodyText);
 
-            // Ensure UserId is in the body (Bug 4 fix)
-            // Emby's POST /Items/{Id}/PlaybackInfo expects UserId in the request body
-            if (!body.UserId) {
-                const userId = getUserId();
-                if (userId) {
-                    body.UserId = userId;
-                    log('Injected UserId into PlaybackInfo body:', userId);
+            // v1.6.5: Always set UserId from adapter state, even if SDK already
+            // set it. The SDK's apiClient.getCurrentUserId() can return empty due
+            // to credential sync race conditions, resulting in an empty UserId.
+            const userId = getUserId();
+            if (userId) {
+                if (!body.UserId || body.UserId !== userId) {
+                    log('Set UserId in PlaybackInfo body:', userId, body.UserId ? '(was: ' + body.UserId + ')' : '(was empty)');
                 }
+                body.UserId = userId;
             }
 
             // Strip Jellyfin-specific top-level fields
@@ -545,17 +547,24 @@
         if (!value) return value;
         let transformed = value;
 
-        // v1.6.3: Only do minimal prefix conversion.
-        // PRESERVE the original DeviceId, Device, Client, and Version fields
-        // so the Emby server can match the session established during login.
-        // Replacing these values (as v1.6.1 did) causes DeviceId mismatch → 401 → redirect to server selection.
+        // Jellyfin prefix -> MediaBrowser prefix (Emby accepts both MediaBrowser and Emby)
         if (transformed.startsWith('Jellyfin ')) {
-            // Jellyfin prefix → MediaBrowser prefix (Emby accepts both MediaBrowser and Emby)
             transformed = 'MediaBrowser ' + transformed.substring('Jellyfin '.length);
         }
-        // Ensure token is present if we have one
-        if (embyAccessToken && !transformed.includes('Token=')) {
-            transformed += ', Token="' + embyAccessToken + '"';
+
+        // v1.6.5 Fix: The @jellyfin/sdk always includes Token="" in the auth header,
+        // even when the access token is empty (race condition on page load, or
+        // credential sync not yet complete). The old check `!includes('Token=')`
+        // would match Token="" and skip injection of the real token -> 401.
+        if (embyAccessToken) {
+            if (transformed.includes('Token=""')) {
+                // Replace the empty token with the adapter's real token
+                transformed = transformed.replace('Token=""', 'Token="' + embyAccessToken + '"');
+                log('Replaced empty Token="" with real access token');
+            } else if (!transformed.includes('Token=')) {
+                // No Token field at all - append it
+                transformed += ', Token="' + embyAccessToken + '"';
+            }
         }
         return transformed;
     }
@@ -943,11 +952,16 @@
             // v1.6.2: Do NOT set User-Agent — it is a forbidden header in browsers
             // and setting it can trigger CORS preflight requests.
 
-            // v1.6.2: Only inject auth headers for non-public endpoints
+            // v1.6.5: Always ensure Authorization header has a valid token.
+            // The SDK may set Authorization with Token="" due to credential race condition.
             const isPublic = isPublicApiEndpoint(this._embyOriginalUrl);
-            if (!isPublic && embyAccessToken && !this._embyHeaders['Authorization']) {
-                const authValue = buildEmbyAuthHeaderValue(embyAccessToken);
-                XHRSetHeader.call(this, 'Authorization', authValue);
+            if (!isPublic && embyAccessToken) {
+                const currentAuth = this._embyHeaders['Authorization'] || '';
+                if (!currentAuth || currentAuth.includes('Token=""')) {
+                    const authValue = buildEmbyAuthHeaderValue(embyAccessToken);
+                    XHRSetHeader.call(this, 'Authorization', authValue);
+                    log('XHR: Overrode empty/missing auth with adapter token');
+                }
             }
 
             if (needsVersionSpoof(this._embyOriginalUrl)) {
