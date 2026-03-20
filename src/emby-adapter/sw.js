@@ -1,11 +1,19 @@
 /**
- * Emby CORS Proxy Service Worker v1.1.0
+ * Emby CORS Proxy Service Worker v1.2.0
  *
  * Intercepts requests to the Emby server and adds CORS headers.
  * This is critical for <video>/<audio> element direct playback,
  * which cannot be intercepted by fetch/XHR monkey-patching.
  *
  * The Emby server origin is received from the main page via postMessage.
+ *
+ * v1.2.0 changes:
+ * - Rewrite /Videos/{id}/stream or /Videos/{id}/original URLs to /Audio/{id}/stream
+ *   to bypass Cloudflare WAF blocking /Videos/ paths with 403 Forbidden.
+ *   /Audio/{id}/stream serves the full original file (video+audio) and supports
+ *   Range requests. This is the CRITICAL fix for video playback 403 errors,
+ *   because <video> element src requests do NOT go through fetch/XHR interceptors
+ *   and can ONLY be rewritten at the Service Worker level.
  *
  * v1.1.0 changes:
  * - Filter out non-standard headers (X-Emby-Authorization, X-MediaBrowser-Token, etc.)
@@ -22,7 +30,7 @@ let embyServerOrigin = '';
 // ==================== Lifecycle ====================
 
 self.addEventListener('install', (event) => {
-    console.log('[SW] Installing Emby CORS Proxy Service Worker v1.1.0');
+    console.log('[SW] Installing Emby CORS Proxy Service Worker v1.2.0');
     self.skipWaiting();
 });
 
@@ -47,11 +55,90 @@ self.addEventListener('message', (event) => {
             event.source.postMessage({
                 type: 'SW_STATUS',
                 embyServerOrigin: embyServerOrigin,
-                version: '1.1.0'
+                version: '1.2.0'
             });
         }
     }
 });
+
+// ==================== Video URL Rewriting ====================
+
+/**
+ * v1.2.0: Rewrite /Videos/ paths to /Audio/ to bypass Cloudflare WAF.
+ *
+ * Cloudflare WAF blocks all requests to /Videos/ (and /videos/) with 403.
+ * The /Audio/{id}/stream endpoint on Emby serves the FULL original file
+ * (video + audio + subtitles) despite the /Audio/ path name. It also
+ * supports Range requests (HTTP 206) for seeking.
+ *
+ * This rewrite handles ALL known URL patterns:
+ *   /Videos/{id}/stream.{ext}   -> /Audio/{id}/stream
+ *   /Videos/{id}/original.{ext} -> /Audio/{id}/stream
+ *   /videos/{id}/stream.{ext}   -> /Audio/{id}/stream
+ *   /videos/{id}/original.{ext} -> /Audio/{id}/stream
+ *   /emby/Videos/{id}/...       -> /emby/Audio/{id}/stream
+ *   /emby/videos/{id}/...       -> /emby/Audio/{id}/stream
+ *
+ * @param {string} url - The original request URL
+ * @returns {string} - The rewritten URL, or the original if no rewrite needed
+ */
+function rewriteVideoUrl(url) {
+    try {
+        const parsed = new URL(url);
+        const pathname = parsed.pathname;
+
+        // Match /Videos/{id}/stream.{ext} or /Videos/{id}/original.{ext}
+        // Also matches with /emby/ prefix and case-insensitive /videos/
+        const match = pathname.match(
+            /^(\/(?:emby\/)?)[Vv]ideos\/([^/]+)\/(stream|original)(?:\.\w+)?$/i
+        );
+        if (match) {
+            const prefix = match[1];   // "/" or "/emby/"
+            const itemId = match[2];
+            parsed.pathname = prefix + 'Audio/' + itemId + '/stream';
+
+            // Ensure Static=true is present for direct stream
+            if (!parsed.searchParams.has('Static')) {
+                parsed.searchParams.set('Static', 'true');
+            }
+
+            console.log('[SW] Rewrote video URL:', pathname, '->', parsed.pathname);
+            return parsed.toString();
+        }
+
+        // Also catch bare /Videos/{id}/stream or /Videos/{id}/original (no extension)
+        const bareMatch = pathname.match(
+            /^(\/(?:emby\/)?)[Vv]ideos\/([^/]+)\/(stream|original)\/?$/i
+        );
+        if (bareMatch) {
+            const prefix = bareMatch[1];
+            const itemId = bareMatch[2];
+            parsed.pathname = prefix + 'Audio/' + itemId + '/stream';
+
+            if (!parsed.searchParams.has('Static')) {
+                parsed.searchParams.set('Static', 'true');
+            }
+
+            console.log('[SW] Rewrote bare video URL:', pathname, '->', parsed.pathname);
+            return parsed.toString();
+        }
+    } catch (e) {
+        console.warn('[SW] Video URL rewrite error:', e);
+    }
+    return url;
+}
+
+/**
+ * Check if a URL is a video stream request that might need rewriting.
+ */
+function isVideoStreamUrl(url) {
+    try {
+        const pathname = new URL(url).pathname.toLowerCase();
+        return /\/videos\/[^/]+\/(stream|original)/.test(pathname);
+    } catch (e) {
+        return false;
+    }
+}
 
 // ==================== Fetch Interceptor ====================
 
@@ -138,7 +225,15 @@ function sanitizeHeaders(originalHeaders) {
 // ==================== Proxy Logic ====================
 
 async function proxyRequest(request) {
-    const url = request.url;
+    let url = request.url;
+
+    // v1.2.0: Rewrite /Videos/ -> /Audio/ to bypass Cloudflare WAF 403
+    // This is the CRITICAL fix for <video> element playback.
+    // <video> src requests do NOT go through fetch/XHR monkey-patches,
+    // so this Service Worker is the ONLY place we can rewrite these URLs.
+    if (isVideoStreamUrl(url)) {
+        url = rewriteVideoUrl(url);
+    }
 
     // Handle OPTIONS preflight
     if (request.method === 'OPTIONS') {
@@ -207,7 +302,7 @@ async function proxyRequest(request) {
 
         // Fallback: try no-cors (gives opaque response)
         try {
-            const opaqueResponse = await fetch(request.url, {
+            const opaqueResponse = await fetch(url, {
                 method: request.method,
                 mode: 'no-cors',
                 credentials: 'omit',
